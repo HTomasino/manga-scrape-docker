@@ -69,19 +69,37 @@ jobs:
       - name: Verify image starts and /healthz responds
         run: |
           docker run -d --name comic-scraper-ghci-test -p 18080:8080 \
-            -e DATA_DIR=/data \
+            -e DATA_DIR=/data -e HOST=0.0.0.0 \
             ${{ steps.verify.outputs.image }}
           for i in {1..30}; do
             if curl -fsS http://localhost:18080/healthz; then
               echo "Health check passed"
-              docker stop comic-scraper-ghci-test
-              docker rm comic-scraper-ghci-test
-              exit 0
+              break
             fi
             sleep 2
+            if [ "$i" = "30" ]; then
+              echo "Health check failed"
+              docker logs comic-scraper-ghci-test || true
+              docker stop comic-scraper-ghci-test || true
+              docker rm comic-scraper-ghci-test || true
+              exit 1
+            fi
           done
-          echo "Health check failed"
-          docker logs comic-scraper-ghci-test || true
-          docker stop comic-scraper-ghci-test || true
-          docker rm comic-scraper-ghci-test || true
-          exit 1
+
+      - name: Verify Playwright driver and Chromium launch (headed, Xvfb)
+        run: |
+          # Exercises the real browser path inside the Debian runtime: the
+          # playwright-go driver (node + package/cli.js), the bundled
+          # chromium-1200 under Xvfb. Catches CDN/driver regressions that
+          # /healthz alone cannot see.
+          docker exec comic-scraper-ghci-test bash -c '
+            set -e
+            /opt/ms-playwright-go/node /opt/ms-playwright-go/package/cli.js --version | grep -q 1.57.0
+            test -d /ms-playwright/chromium-1200
+            Xvfb :98 -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 &
+            sleep 1
+            DISPLAY=:98 /opt/ms-playwright-go/node /opt/ms-playwright-go/package/cli.js --help >/dev/null
+            echo "Playwright driver + chromium present; Xvfb starts"
+          '
+          docker stop comic-scraper-ghci-test
+          docker rm comic-scraper-ghci-test

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -972,6 +973,49 @@ func (s *Server) setMangaScrapingPaused(paused bool) {
 	}
 }
 
+// consoleBuf is a size-capped in-memory copy of every log line the server
+// writes, used by the web UI Console tab (GET /api/console).
+type consoleBuf struct {
+	mu    sync.Mutex
+	lines []string
+	max   int
+	drop  uint64
+}
+
+var console = &consoleBuf{max: 1000}
+
+// Write implements io.Writer. The std log package writes one full line per
+// call (it appends a newline when missing), so each Write is stored as a
+// single line. When the buffer is full, oldest lines are evicted in batches
+// and drop counts them so the UI can show how many were discarded.
+func (c *consoleBuf) Write(p []byte) (int, error) {
+	text := strings.TrimRight(string(p), "\n")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.lines) >= c.max {
+		keep := c.max / 4
+		c.drop += uint64(len(c.lines) - keep)
+		c.lines = append([]string(nil), c.lines[len(c.lines)-keep:]...)
+	}
+	c.lines = append(c.lines, text)
+	return len(p), nil
+}
+
+// snapshot returns the buffered lines and the number of older lines that were
+// discarded to stay under the cap.
+func (c *consoleBuf) snapshot() (lines []string, dropped uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.lines...), c.drop
+}
+
+// handleConsole serves the in-memory console log buffer as JSON.
+func (s *Server) handleConsole(w http.ResponseWriter, r *http.Request) {
+	lines, dropped := console.snapshot()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"lines": lines, "dropped": dropped})
+}
+
 // handleGetMangaScrapingState returns whether global manga scraping is running.
 func (s *Server) handleGetMangaScrapingState(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1259,6 +1303,14 @@ func (s *Server) setupHTTPServer(addr string) error {
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
+	})
+
+	mux.HandleFunc("/api/console", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleConsole(w, r)
 	})
 
 	mux.HandleFunc("/api/shutdown", func(w http.ResponseWriter, r *http.Request) {
@@ -4257,6 +4309,11 @@ func main() {
 	background := flag.Bool("d", false, "Run in background (detached from terminal)")
 	flag.Parse()
 
+	// Mirror all log output into the in-memory console buffer (web UI
+	// Console tab) while still writing to stderr.
+	log.SetFlags(log.LstdFlags)
+	log.SetOutput(io.MultiWriter(os.Stderr, console))
+
 	if *background {
 		runDetached()
 	}
@@ -4312,6 +4369,7 @@ const indexHTML = `<!DOCTYPE html>
                 <button class="nav-btn" data-tab="hmanga">H-Manga</button>
                 <button class="nav-btn" data-tab="downloads">Downloads</button>
                 <button class="nav-btn" data-tab="settings">Settings</button>
+                <button class="nav-btn" data-tab="console">Console</button>
                 <button class="btn btn-secondary" id="theme-toggle" style="margin-left: auto;">🌙 Dark Mode</button>
             </nav>
             <div class="global-actions">
@@ -4419,6 +4477,17 @@ const indexHTML = `<!DOCTYPE html>
                     <div id="downloads-list">
                         <p class="empty">No active downloads.</p>
                     </div>
+                </div>
+            </section>
+
+            <!-- Console Tab -->
+            <section id="console-tab" class="tab-content">
+                <div class="card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h2 style="margin: 0;">Console Output</h2>
+                        <span id="console-meta" class="help-text"></span>
+                    </div>
+                    <pre id="console-output" class="console-output">Loading console output...</pre>
                 </div>
             </section>
 
@@ -4907,6 +4976,25 @@ nav {
     padding: 40px;
 }
 
+.console-output {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    font-family: Consolas, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 12px;
+    border-radius: 6px;
+    height: 70vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin: 0;
+}
+
+[data-theme="dark"] .console-output {
+    border: 1px solid #1a4b7a;
+}
+
 .toast {
     position: fixed;
     bottom: 20px;
@@ -5211,8 +5299,43 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
         if (btn.dataset.tab === 'hmanga') loadHMArtists();
         if (btn.dataset.tab === 'downloads') loadDownloads();
         if (btn.dataset.tab === 'settings') loadSettings();
+        if (btn.dataset.tab === 'console') startConsolePolling(); else stopConsolePolling();
     });
 });
+
+// Console tab: polls /api/console every 3s while the tab is active. Polling
+// starts when the tab is opened and stops when any other tab is opened, so
+// the server does not serve console snapshots that nobody is watching.
+let consolePollTimer = null;
+
+function startConsolePolling() {
+    if (consolePollTimer) return;
+    refreshConsole();
+    consolePollTimer = setInterval(refreshConsole, 3000);
+}
+
+function stopConsolePolling() {
+    if (consolePollTimer) {
+        clearInterval(consolePollTimer);
+        consolePollTimer = null;
+    }
+}
+
+async function refreshConsole() {
+    const out = document.getElementById('console-output');
+    const meta = document.getElementById('console-meta');
+    try {
+        const response = await fetch('/api/console');
+        const data = await response.json();
+        const atBottom = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+        const text = data.lines.length ? data.lines.join('\\n') : '';
+        out.textContent = text || 'No console output yet.';
+        meta.textContent = data.lines.length + ' lines' + (data.dropped > 0 ? ' (' + data.dropped + ' older lines discarded)' : '');
+        if (atBottom) out.scrollTop = out.scrollHeight;
+    } catch (err) {
+        meta.textContent = 'Failed to refresh: ' + err;
+    }
+}
 
 // Show toast notification
 function showToast(message, type = 'info') {

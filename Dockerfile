@@ -17,20 +17,16 @@ ENV GOARCH=amd64
 RUN go build -ldflags="-s -w" -o /usr/local/bin/comic-scraper-web ./cmd/web \
     && go build -ldflags="-s -w" -o /usr/local/bin/comic-scraper-cli ./cmd/cli
 
-# Install the playwright-go driver (node + package) into a known path.
-# playwright.Run() refuses to start without it ("please install the driver
-# (v1.57.0) first"). PLAYWRIGHT_DRIVER_PATH is read by playwright-go's
-# transformRunOptions, so the runtime stage gets it verbatim via COPY.
-ENV PLAYWRIGHT_DRIVER_PATH=/opt/ms-playwright-go
-RUN go run github.com/playwright-community/playwright-go/cmd/playwright@v0.5700.1 install
-
 # Runtime stage: Playwright + Chromium on Ubuntu Jammy.
 # Tag must match the playwright-go driver version in go.mod
 # (playwright-go v0.5700.1 -> driver 1.57.0).
 FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Location of the Go playwright driver copied from the builder stage.
+# playwright-go looks up its driver (node + package/cli.js) via this env var
+# (transformRunOptions). Assembled below from the npm playwright-core tarball
+# because the /builds/driver CDN used by playwright-go's `playwright install`
+# is deprecated and now 404s for 1.57.0 (see playwright-go issue #593).
 ENV PLAYWRIGHT_DRIVER_PATH=/opt/ms-playwright-go
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -41,7 +37,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /opt/ms-playwright-go /opt/ms-playwright-go
+# Assemble the playwright-go driver in the required layout:
+#   /opt/ms-playwright-go/node            <- node binary (MCR image ships one at /usr/bin/node)
+#   /opt/ms-playwright-go/package/cli.js  + full playwright-core lib
+# The npm tarball already contains package/cli.js (the file playwright-go's
+# getDriverCliJs expects); node is symlinked from the image into the driver
+# dir because playwright-go resolves its node binary relative to the driver
+# path. The --version check fails the build if the assembly is broken.
+RUN set -eux; \
+    mkdir -p /opt/ms-playwright-go/package; \
+    curl -fsSL https://registry.npmjs.org/playwright-core/-/playwright-core-1.57.0.tgz \
+      -o /tmp/pw.tgz; \
+    tar -xzf /tmp/pw.tgz -C /opt/ms-playwright-go package; \
+    ln -s /usr/bin/node /opt/ms-playwright-go/node; \
+    node /opt/ms-playwright-go/package/cli.js --version | grep -q 1.57.0
+
 COPY --from=builder /usr/local/bin/comic-scraper-web /usr/local/bin/comic-scraper-web
 COPY --from=builder /usr/local/bin/comic-scraper-cli /usr/local/bin/comic-scraper-cli
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
