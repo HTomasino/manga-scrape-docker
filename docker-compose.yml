@@ -1,0 +1,67 @@
+services:
+  scraper:
+    image: ghcr.io/htomasino/manga-scrape-docker:latest
+    container_name: comic-scraper
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      # Bind to all interfaces so LAN browsers can reach the UI.
+      - HOST=0.0.0.0
+      - DATA_DIR=/data
+      - PUID=1000
+      - PGID=1000
+      # Add your host's LAN IP so browsers on other machines pass the CSRF
+      # check (comma-separated for multiple). E.g. CSRF_ALLOWED_HOSTS=192.168.1.50
+      - CSRF_ALLOWED_HOSTS=
+    volumes:
+      - ./data/config:/data/config
+      - ./data/downloads:/data/downloads
+      - ./data/hmanga:/data/hmanga-downloads
+      - ./data/profile:/data/profile
+    restart: unless-stopped
+    # Must exceed SCRAPE_SHUTDOWN_TIMEOUT_SECONDS (default 600s) so in-flight
+    # downloads finish before Docker escalates to SIGKILL.
+    stop_grace_period: 15m
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+
+  # Auto-update watcher: polls GHCR and recreates the scraper container when a
+  # new image digest appears. Only watches containers with the
+  # com.centurylinklabs.watchtower.enable=true label.
+  watchtower:
+    image: containrrr/watchtower
+    container_name: comic-scraper-watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=false
+      # Watchtower's own stop timeout when recreating the scraper (default 30s
+      # would SIGKILL in-flight downloads despite stop_grace_period).
+      - WATCHTOWER_TIMEOUT=15m
+    restart: unless-stopped
+
+  # ---- Network-drive volume examples (Linux engines only; see Docs/DOCKER.md) ----
+  # Uncomment the matching volume below, then reference it in the scraper's
+  # volumes list instead of (or in addition to) the ./data bind mounts.
+  #
+  # SMB/CIFS share:
+  #
+  # volumes:
+  #   nas-downloads:
+  #     driver_opts:
+  #       type: cifs
+  #       o: addr=192.168.1.100,username=scraper,password=${NAS_PASSWORD},uid=1000,gid=1000,file_mode=0644,dir_mode=0755
+  #       device: //nas/comics
+  #
+  # NFS export:
+  #
+  # volumes:
+  #   nas-downloads:
+  #     driver_opts:
+  #       type: nfs
+  #       o: addr=192.168.1.100,rw
+  #       device: :/mnt/tank/comics

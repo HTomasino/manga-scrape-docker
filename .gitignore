@@ -1,0 +1,42 @@
+# Comic Scraper - GitIgnore
+
+# Build output
+*.exe
+*.exe.backup
+
+# Go installer
+*.msi
+
+# Debug/test artifacts
+*.html
+!cmd/web/templates/*.html
+
+# Dependencies
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Kilo/UI dist directories
+.kilo/*
+.playwright-mcp/*
+
+# Keep source directories
+!*.js
+!*.ts
+!*.json
+!*.css
+!*.md
+!.kilo/ui/src/**
+!.kilo/src/**
+!.kilo/plans/**
+!.kilo/README.md
+!.gitignore
+.kilo/ui/nul
