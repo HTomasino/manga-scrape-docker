@@ -5328,7 +5328,7 @@ async function refreshConsole() {
         const response = await fetch('/api/console');
         const data = await response.json();
         const atBottom = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
-        const text = data.lines.length ? data.lines.join('\\n') : '';
+        const text = data.lines.length ? data.lines.join('\n') : '';
         out.textContent = text || 'No console output yet.';
         meta.textContent = data.lines.length + ' lines' + (data.dropped > 0 ? ' (' + data.dropped + ' older lines discarded)' : '');
         if (atBottom) out.scrollTop = out.scrollHeight;
