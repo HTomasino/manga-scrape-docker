@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -190,6 +191,15 @@ func registerHMangaRoutes(mux *http.ServeMux, s *Server) {
 		}
 	})
 
+	// Bulk interval: applies to every artist NOT set to `never` (explicit
+	// opt-outs are preserved). Registered before the per-artist prefix handler.
+	mux.HandleFunc(`/api/hmanga/artists/bulk-check-interval`, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, `Method not allowed`, http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleBulkHMCheckInterval(w, r)
+	})
 	// Global all-artist actions must be registered before the generic
 	// per-artist prefix handler, otherwise "check-all" is parsed as an artist ID.
 	mux.HandleFunc("/api/hmanga/artists/check-all", func(w http.ResponseWriter, r *http.Request) {
@@ -345,7 +355,7 @@ func (s *Server) loadOrCreateHMangaRegistry() error {
 			}
 		}
 	} else {
-		// File missing Ã¢â‚¬â€ will be created on first save.
+		// File missing ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â will be created on first save.
 		needsSave = true
 	}
 
@@ -385,7 +395,16 @@ func (s *Server) saveHMangaRegistry() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// Write only when content differs from the last persisted snapshot;
+	// all callers hold s.mu so the snapshot check is race-free.
+	if s.hmangaRegistrySnapshots != nil && bytes.Equal(s.hmangaRegistrySnapshots, data) {
+		return nil
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return err
+	}
+	s.hmangaRegistrySnapshots = append([]byte(nil), data...)
+	return nil
 }
 
 // updateHMangaRegistryEntry safely updates an artist registry entry by ID.
@@ -444,7 +463,16 @@ func (s *Server) saveHMangaGlobalCache(cache *hmanga.GlobalBookCache) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// Write only when content differs from the last persisted snapshot;
+	// callers hold hmangaGlobalMu so the snapshot check is race-free.
+	if s.hmangaGlobalSnapshots != nil && bytes.Equal(s.hmangaGlobalSnapshots, data) {
+		return nil
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return err
+	}
+	s.hmangaGlobalSnapshots = append([]byte(nil), data...)
+	return nil
 }
 
 // rebuildHMangaGlobalCache rebuilds the global cache from all in-memory
@@ -655,7 +683,18 @@ func (s *Server) saveHMangaBookState(folderName string, st *hmanga.BookStateFile
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.getHMangaBookStatePath(folderName), data, 0644)
+	// Write only when the serialized content differs from the last persisted
+	// snapshot: periodic artist scrapes rewrite LastSynced and counter fields
+	// without altering downloads, and writing .books.json on every scrape
+	// hammered the storage server. Caller must hold hmangaStateMu.
+	if prev, ok := s.hmangaStateSnapshots[folderName]; ok && bytes.Equal(prev, data) {
+		return nil
+	}
+	if err := os.WriteFile(s.getHMangaBookStatePath(folderName), data, 0644); err != nil {
+		return err
+	}
+	s.hmangaStateSnapshots[folderName] = append([]byte(nil), data...)
+	return nil
 }
 
 // ==================== Folder scanning ====================
@@ -783,7 +822,7 @@ func (s *Server) scanHMangaArtists() error {
 			continue
 		}
 
-		// Read/derive everything from st.Books under hmangaStateMu — this scan
+		// Read/derive everything from st.Books under hmangaStateMu ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â this scan
 		// runs concurrently with startup ops that mutate the same state files.
 		s.hmangaStateMu.Lock()
 		// Trust .books.json for the initial scan; verification runs separately
@@ -941,7 +980,7 @@ func (s *Server) reconcileHMArtistStateLocked(st *hmanga.BookStateFile, root str
 
 // countDownloadedBooks returns how many books in the state file are marked
 // as downloaded. Caller must hold s.hmangaStateMu (so Books can't be
-// mutated concurrently) — not asserted, but required for correctness.
+// mutated concurrently) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â not asserted, but required for correctness.
 func countDownloadedBooks(st *hmanga.BookStateFile) int {
 	if st == nil {
 		return 0
@@ -1445,7 +1484,7 @@ func (s *Server) handleSyncAllHMArtists(w http.ResponseWriter, r *http.Request) 
 
 // handleCleanupHMZips starts a background scan over every artist folder in the
 // H-Manga download path. For each ZIP on disk it:
-//  1. Applies the configured hmangaZipNameRegex to the name — if the name
+//  1. Applies the configured hmangaZipNameRegex to the name ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â if the name
 //     changes (i.e. the rename hasn't been done yet), the ZIP is renamed,
 //     unless the target name already exists (skipped to avoid clobbering).
 //  2. When hmangaExtractZips is enabled, extracts the (possibly renamed) ZIP
@@ -1559,7 +1598,7 @@ func (s *Server) cleanupHMZips(folder string, extractEnabled bool, re *regexp.Re
 			if cleaned != "" && base != "" && strings.EqualFold(filepath.Ext(cleaned), ".zip") && cleaned != name {
 				target := filepath.Join(dir, cleaned)
 				if _, statErr := os.Stat(target); statErr == nil {
-					// Target exists — do not clobber.
+					// Target exists ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â do not clobber.
 					log.Printf("[HMANGA-CLEANUP] %s: %s -> %s already exists, skipping rename", folder, name, cleaned)
 					skipped++
 					continue
@@ -1763,6 +1802,51 @@ func (s *Server) handleForceHMRedownload(w http.ResponseWriter, r *http.Request,
 	json.NewEncoder(w).Encode(map[string]string{"status": "redownloading", "artistId": artistID})
 }
 
+// handleBulkHMCheckInterval sets the auto-check interval for every artist
+// that is not already set to `never`. Artists set to never (manual only) are
+// deliberately ignored so a bulk change cannot re-enable auto-checking for
+// artists the user explicitly opted out of. Returns how many were updated.
+func (s *Server) handleBulkHMCheckInterval(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CheckInterval string `json:"checkInterval"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if _, ok := models.ParseCheckInterval(req.CheckInterval); !ok {
+		http.Error(w, "Invalid check interval", http.StatusBadRequest)
+		return
+	}
+	updated := 0
+	s.mu.Lock()
+	for i := range s.hmangaRegistry.Artists {
+		a := &s.hmangaRegistry.Artists[i]
+		if a.CheckInterval == "never" {
+			continue // user opted out; bulk change must not re-enable
+		}
+		if a.CheckInterval != req.CheckInterval {
+			a.CheckInterval = req.CheckInterval
+			a.UpdatedAt = time.Now()
+			// Mirror to the in-memory artist map (aliases the registry slice).
+			if artist, ok := s.hmangaArtists[a.ID]; ok {
+				artist.CheckInterval = req.CheckInterval
+			}
+			updated++
+		}
+	}
+	if updated > 0 {
+		s.saveHMangaRegistry()
+	}
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":       "Bulk check interval updated",
+		"updated":       updated,
+		"checkInterval": req.CheckInterval,
+	})
+}
+
 // handleUpdateHMCheckInterval sets the auto-check interval for an artist.
 func (s *Server) handleUpdateHMCheckInterval(w http.ResponseWriter, r *http.Request, artistID string) {
 	var req struct {
@@ -1804,7 +1888,7 @@ func (s *Server) hmangaArtistExists(artistID string) bool {
 // autoDownloadMissingBooks downloads every book for an artist that is not yet
 // downloaded, respecting the manager's 2-concurrent semaphore. If manual is
 // true (user-invoked /sync, /sync-all, download of known books), the H-Manga
-// scraping pause does not abort the loop — sync of known books is documented
+// scraping pause does not abort the loop ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â sync of known books is documented
 // to work while paused. The pause check still applies to scheduler and
 // post-scrape auto-download invocations.
 func (s *Server) autoDownloadMissingBooks(artistID string, manual ...bool) {
@@ -1847,7 +1931,7 @@ func (s *Server) autoDownloadMissingBooks(artistID string, manual ...bool) {
 		return
 	}
 
-	// Snapshot the book list under hmangaStateMu — st.Books is mutated
+	// Snapshot the book list under hmangaStateMu ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â st.Books is mutated
 	// concurrently by downloads and scrapes.
 	s.hmangaStateMu.Lock()
 	ids := make([]string, 0, len(st.Books))
@@ -2048,7 +2132,7 @@ func (s *Server) downloadHMBookWithID(artistID, folderName, bookID, title, dlID 
 	if s.config.VerifyHMDownloads {
 		st := s.getHMangaBookState(folderName)
 		if st != nil {
-			// Read st.Books under hmangaStateMu — the map is mutated
+			// Read st.Books under hmangaStateMu ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the map is mutated
 			// concurrently by scrapes and other downloads.
 			s.hmangaStateMu.Lock()
 			b, ok := st.Books[bookID]
@@ -2135,7 +2219,7 @@ func (s *Server) downloadHMBookWithID(artistID, folderName, bookID, title, dlID 
 	extracted := false
 	if s.config.HMangaExtractZips {
 		if exErr := s.extractHMBookZip(folderName, bookID, expectedPath); exErr != nil {
-			log.Printf("[HMANGA] Extraction failed for book %s (%s): %v — keeping ZIP", bookID, folderName, exErr)
+			log.Printf("[HMANGA] Extraction failed for book %s (%s): %v ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â keeping ZIP", bookID, folderName, exErr)
 			s.markHMangaDownloadFailed(dl.ID)
 			s.handleHMBookDownloadFailure(artistID, folderName, bookID, dl.ID, fmt.Errorf("extraction failed: %w", exErr))
 			return
@@ -2146,7 +2230,7 @@ func (s *Server) downloadHMBookWithID(artistID, folderName, bookID, title, dlID 
 	// Persist the .books.json entry + global cache ownership. This is the
 	// source-of-truth update; if it fails the file is still on disk and a
 	// later scan will reconcile it, but the Download record must NOT be
-	// marked Completed until this returns without error — otherwise the
+	// marked Completed until this returns without error ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â otherwise the
 	// book would silently "disappear" on the next startup.
 	wasNew, recErr := s.recordHMBookDownloaded(artistID, folderName, bookID, filename, size, extracted)
 	if recErr != nil {
@@ -2205,7 +2289,7 @@ func (s *Server) markHMangaDownloadFailed(dlID string) {
 		existing.Status = models.StatusFailed
 		existing.UpdatedAt = time.Now()
 	}
-	// Protected by s.mu — must run inside the locked section.
+	// Protected by s.mu ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â must run inside the locked section.
 	delete(s.hmangaLastLoggedBytes, dlID)
 	s.mu.Unlock()
 }
@@ -2282,8 +2366,8 @@ func (s *Server) handleHMBookDownloadFailure(artistID, folderName, bookID, dlID 
 // recordHMBookDownloaded marks a book as downloaded in .books.json and updates
 // the registry counters, then mirrors the change into the global cache.
 //
-// The persistence step is keyed by (artistID, folderName, bookID) — NOT by
-// the Download record — so the bookkeeping is correct even if the user has
+// The persistence step is keyed by (artistID, folderName, bookID) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â NOT by
+// the Download record ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â so the bookkeeping is correct even if the user has
 // already cleared the download from the Downloads tab.
 //
 // If the per-artist .books.json has no entry for bookID (e.g. a single-book
@@ -2295,7 +2379,7 @@ func (s *Server) handleHMBookDownloadFailure(artistID, folderName, bookID, dlID 
 // download, false when re-persisting an already-downloaded entry). On save
 // failure the in-memory state is rolled back to its prior value and the
 // returned error explains why. Callers MUST treat a non-nil error as a
-// hard failure and avoid marking the Download record Completed — otherwise
+// hard failure and avoid marking the Download record Completed ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â otherwise
 // the file will be on disk but .books.json will not reflect it and the
 // book will "disappear" on the next startup.
 func (s *Server) recordHMBookDownloaded(artistID, folderName, bookID, filename string, size int64, extracted bool) (bool, error) {
@@ -2417,7 +2501,7 @@ func (s *Server) reconcileHMBookState(artistID, folderName string) {
 		return
 	}
 
-	// Count while still holding hmangaStateMu — st.Books is shared state.
+	// Count while still holding hmangaStateMu ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â st.Books is shared state.
 	downloaded := 0
 	for _, bb := range st.Books {
 		if bb.Downloaded {
@@ -2447,7 +2531,7 @@ func (s *Server) forceHMRedownload(artistID, folderName string) {
 	if !s.waitHMangaDownloadDone(artistID) {
 		// A sync/download for this artist is still running after the wait
 		// timeout. Proceeding would delete zips mid-download and record
-		// stale state — abort instead.
+		// stale state ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â abort instead.
 		log.Printf("[HMANGA] Force redownload aborted for %s: a sync/download is still in progress after wait timeout", folderName)
 		return
 	}
@@ -2525,7 +2609,7 @@ func (s *Server) forceHMRedownload(artistID, folderName string) {
 	// the per-artist .books.json is already persisted as "all reset" and the
 	// zip files are already deleted, so restoring the prior global cache would
 	// leave the system in an inconsistent state where the artist still claims
-	// ownership of books that no longer exist on disk — autoDownloadMissingBooks
+	// ownership of books that no longer exist on disk ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â autoDownloadMissingBooks
 	// would then skip them and the force-redownload would silently no-op.
 	// Rebuilding the global cache from the (now-reset) per-artist state is the
 	// only way to reach a consistent on-disk + in-memory state. If even that

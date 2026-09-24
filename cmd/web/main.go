@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -63,6 +64,30 @@ type Server struct {
 	// race: one loads the file, the other saves, and the first's save overwrites
 	// the second's changes.
 	chapterStateMu sync.Mutex
+
+	// chapterStateCache holds the last-known chapter state for each series
+	// folder in memory. loadChapterState serves reads from this cache and
+	// only reads the .chapters.json file the first time a folder is touched.
+	// saveChapterState deep-compares against the last persisted snapshot and
+	// skips the disk write when nothing changed, so periodic scrapes that
+	// only refresh timestamps no longer hammer the storage server.
+	// All access must hold chapterStateMu (or use the wrapper functions).
+	chapterStateCache map[string]*ChapterStateFile
+
+	// hmangaStateSnapshots stores the last-persisted JSON of each artist's
+	// .books.json so saveHMangaBookState can skip writes when the serialized
+	// content is unchanged. Access requires hmangaStateMu.
+	hmangaStateSnapshots map[string][]byte
+
+	// hmangaGlobalSnapshots stores the last-persisted JSON of the global
+	// H-Manga book cache so saveHMangaGlobalCache can skip unchanged writes.
+	// Access requires hmangaGlobalMu.
+	hmangaGlobalSnapshots []byte
+
+	// hmangaRegistrySnapshots stores the last-persisted JSON of the H-Manga
+	// artist registry so saveHMangaRegistry can skip unchanged writes.
+	// Access requires s.mu.
+	hmangaRegistrySnapshots []byte
 
 	// Scheduler for periodic updates
 	schedulerRunning bool
@@ -276,6 +301,8 @@ func NewServer() (*Server, error) {
 		downloads:               make(map[string]*models.Download),
 		checking:                make(map[string]bool),
 		downloading:             make(map[string]bool),
+		chapterStateCache:       make(map[string]*ChapterStateFile),
+		hmangaStateSnapshots:    make(map[string][]byte),
 		hmangaArtists:           make(map[string]*hmanga.Artist),
 		hmangaBooks:             make(map[string][]hmanga.Book),
 		hmangaBookStates:        make(map[string]*hmanga.BookStateFile),
@@ -398,8 +425,11 @@ func (s *Server) scanDownloadFolder() error {
 		regEntry := s.getOrCreateRegistryEntry(s.registry, folderName)
 		regEntry.UpdatedAt = time.Now()
 
-		// Load chapter state file (if exists)
-		chapterState, _ := s.loadChapterState(folderName)
+		// Load/mutate/save under one chapterStateMu hold: the state cache
+		// aliases objects, so this reconcile must be synchronized against
+		// concurrent writers (updateChapterState, autoDownload, ...).
+		s.chapterStateMu.Lock()
+		chapterState, _ := s.loadChapterStateLocked(folderName)
 
 		// Count downloaded chapters from state file and verify against disk
 		downloadedCount := 0
@@ -420,9 +450,7 @@ func (s *Server) scanDownloadFolder() error {
 				}
 			}
 			if stateChanged {
-				s.chapterStateMu.Lock()
-				s.saveChapterState(folderName, chapterState)
-				s.chapterStateMu.Unlock()
+				s.saveChapterStateLocked(folderName, chapterState)
 			}
 		} else {
 			// No chapter state file yet, but folders exist - mark all as downloaded
@@ -441,8 +469,9 @@ func (s *Server) scanDownloadFolder() error {
 					ImageCount: imageCount,
 				}
 			}
-			s.saveChapterState(folderName, chapterState)
+			s.saveChapterStateLocked(folderName, chapterState)
 		}
+		s.chapterStateMu.Unlock()
 
 		// Update registry with latest counts
 		regEntry.ChapterCount = chapterCount
@@ -519,8 +548,8 @@ func (s *Server) updateChapterState(seriesID, chapterID string, dl *models.Downl
 	s.chapterStateMu.Lock()
 	defer s.chapterStateMu.Unlock()
 
-	// Load chapter state from series folder
-	chapterState, err := s.loadChapterState(folderName)
+	// Load chapter state from series folder (Locked variant: lock already held)
+	chapterState, err := s.loadChapterStateLocked(folderName)
 	if err != nil {
 		log.Printf("Failed to load chapter state for update: %v", err)
 		return
@@ -577,7 +606,7 @@ func (s *Server) updateChapterState(seriesID, chapterID string, dl *models.Downl
 		chapterState.Chapters[chapterKey] = newInfo
 	}
 
-	if err := s.saveChapterState(folderName, chapterState); err != nil {
+	if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
 		log.Printf("Failed to save chapter state after download: %v", err)
 	}
 
@@ -709,8 +738,10 @@ func (s *Server) resetStaleDownloadState() {
 			folderName = series.Title
 		}
 
-		chapterState, err := s.loadChapterState(folderName)
+		s.chapterStateMu.Lock()
+		chapterState, err := s.loadChapterStateLocked(folderName)
 		if err != nil || chapterState == nil {
+			s.chapterStateMu.Unlock()
 			continue
 		}
 
@@ -792,12 +823,9 @@ func (s *Server) resetStaleDownloadState() {
 		}
 
 		if stateChanged {
-			s.chapterStateMu.Lock()
-			if err := s.saveChapterState(folderName, chapterState); err != nil {
+			if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
 				log.Printf("[STARTUP-RESET] Failed to save chapter state for '%s': %v", folderName, err)
 			}
-			s.chapterStateMu.Unlock()
-
 			// Update the in-memory series download count
 			downloadedCount := 0
 			for _, c := range chapterState.Chapters {
@@ -814,6 +842,9 @@ func (s *Server) resetStaleDownloadState() {
 			s.updateRegistryEntry(id, func(e *RegistryEntry) {
 				e.ChaptersDownloaded = downloadedCount
 			})
+			s.chapterStateMu.Unlock()
+		} else {
+			s.chapterStateMu.Unlock()
 		}
 	}
 
@@ -865,7 +896,8 @@ func (s *Server) syncAllSeriesOnStartup() {
 		if folderName == "" {
 			folderName = series.Title
 		}
-		chapterState, _ := s.loadChapterState(folderName)
+		s.chapterStateMu.Lock()
+		chapterState, _ := s.loadChapterStateLocked(folderName)
 		if chapterState != nil {
 			for _, chInfo := range chapterState.Chapters {
 				if !chInfo.Downloaded {
@@ -873,7 +905,9 @@ func (s *Server) syncAllSeriesOnStartup() {
 					break
 				}
 			}
-		} else if series.ChaptersDownloaded < series.ChapterCount {
+		}
+		s.chapterStateMu.Unlock()
+		if chapterState == nil && series.ChaptersDownloaded < series.ChapterCount {
 			// No state file but counts suggest missing chapters
 			needsSync = true
 		}
@@ -1160,7 +1194,15 @@ func (s *Server) setupHTTPServer(addr string) error {
 	})
 
 	mux.HandleFunc("/api/series/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/chapters") {
+		// Bulk interval must be matched before per-series suffix handlers (its
+		// path has no series ID).
+		if strings.HasSuffix(r.URL.Path, "/bulk-check-interval") {
+			if r.Method == http.MethodPut {
+				s.handleBulkCheckInterval(w, r)
+			} else {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
+		} else if strings.HasSuffix(r.URL.Path, "/chapters") {
 			if r.Method == http.MethodGet {
 				s.handleGetChapters(w, r)
 			} else {
@@ -1583,8 +1625,13 @@ func (s *Server) updateRegistryEntry(seriesID string, updateFn func(*RegistryEnt
 	}
 	for i := range s.registry.Series {
 		if s.registry.Series[i].ID == seriesID {
+			prior := s.registry.Series[i]
 			updateFn(&s.registry.Series[i])
-			s.saveRegistry(s.registry)
+			// RegistryEntry is fully comparable (strings, ints, time.Time), so a
+			// direct == check detects no-op updates and skips the disk write.
+			if s.registry.Series[i] != prior {
+				s.saveRegistry(s.registry)
+			}
 			return true
 		}
 	}
@@ -2025,7 +2072,7 @@ func (s *Server) refreshSeriesChapters(series *models.Series) int {
 	// Load or create chapter state (under lock to prevent race with concurrent
 	// updateChapterState or autoDownloadMissingChapters saves)
 	s.chapterStateMu.Lock()
-	chapterState, _ := s.loadChapterState(folderName)
+	chapterState, _ := s.loadChapterStateLocked(folderName)
 	if chapterState == nil {
 		chapterState = &ChapterStateFile{
 			SeriesID:   series.ID,
@@ -2061,7 +2108,7 @@ func (s *Server) refreshSeriesChapters(series *models.Series) int {
 		}
 	}
 
-	if err := s.saveChapterState(folderName, chapterState); err != nil {
+	if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
 		log.Printf("Failed to save chapter state for %s: %v", series.ID, err)
 	}
 	s.chapterStateMu.Unlock()
@@ -2361,6 +2408,51 @@ func (s *Server) handleUpdateCheckInterval(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+// handleBulkCheckInterval sets the auto-check interval for every series that
+// is not already set to "never". Series set to never (manual only) are
+// deliberately ignored so a bulk change cannot re-enable auto-checking for
+// items the user explicitly opted out of. Returns how many were updated.
+func (s *Server) handleBulkCheckInterval(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CheckInterval string `json:"checkInterval"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if _, ok := models.ParseCheckInterval(req.CheckInterval); !ok {
+		http.Error(w, "Invalid check interval", http.StatusBadRequest)
+		return
+	}
+	updated := 0
+	s.mu.Lock()
+	for i := range s.registry.Series {
+		e := &s.registry.Series[i]
+		if e.CheckInterval == "never" {
+			continue // user opted out; bulk change must not re-enable
+		}
+		if e.CheckInterval != req.CheckInterval {
+			e.CheckInterval = req.CheckInterval
+			e.UpdatedAt = time.Now()
+			// Mirror to the in-memory series map so the UI dropdowns agree.
+			if series, ok := s.series[e.ID]; ok {
+				series.CheckInterval = req.CheckInterval
+			}
+			updated++
+		}
+	}
+	if updated > 0 {
+		s.saveRegistry(s.registry)
+	}
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":       "Bulk check interval updated",
+		"updated":       updated,
+		"checkInterval": req.CheckInterval,
+	})
+}
+
 // handleGetState returns the download state for a series (using new format)
 func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	// Extract series ID from path: /api/series/{id}/state
@@ -2386,8 +2478,10 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	if folderName == "" {
 		folderName = series.Title
 	}
-	chapterState, err := s.loadChapterState(folderName)
+	s.chapterStateMu.Lock()
+	chapterState, err := s.loadChapterStateLocked(folderName)
 	if err != nil {
+		s.chapterStateMu.Unlock()
 		http.Error(w, fmt.Sprintf("Failed to load chapter state: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -2399,7 +2493,18 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 			URL:        series.URL,
 			Chapters:   make(map[string]ChapterInfo),
 		}
+	} else {
+		// Snapshot-copy so the JSON encode below reads a stable map even
+		// while writers mutate the cached original.
+		cp := *chapterState
+		cp.Chapters = make(map[string]ChapterInfo, len(chapterState.Chapters))
+		for k, v := range chapterState.Chapters {
+			v.PerImageStatus = append([]models.ImageResult(nil), v.PerImageStatus...)
+			cp.Chapters[k] = v
+		}
+		chapterState = &cp
 	}
+	s.chapterStateMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(chapterState)
@@ -2442,7 +2547,7 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.chapterStateMu.Lock()
-	chapterState, err := s.loadChapterState(folderName)
+	chapterState, err := s.loadChapterStateLocked(folderName)
 	if err != nil || chapterState == nil {
 		s.chapterStateMu.Unlock()
 		http.Error(w, "No chapter state found", http.StatusNotFound)
@@ -2642,13 +2747,13 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 
 	s.chapterStateMu.Lock()
 	// Re-load under lock to merge any concurrent writes before saving.
-	if latestState, loadErr := s.loadChapterState(folderName); loadErr == nil && latestState != nil {
+	if latestState, loadErr := s.loadChapterStateLocked(folderName); loadErr == nil && latestState != nil {
 		for chapterKey, chInfo := range chapterState.Chapters {
 			latestState.Chapters[chapterKey] = chInfo
 		}
 		chapterState = latestState
 	}
-	if err := s.saveChapterState(folderName, chapterState); err != nil {
+	if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
 		log.Printf("[SCAN-MISSING] Failed to save chapter state: %v", err)
 	}
 	s.chapterStateMu.Unlock()
@@ -2729,7 +2834,7 @@ func (s *Server) handleForceRedownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.chapterStateMu.Lock()
-	chapterState, err := s.loadChapterState(folderName)
+	chapterState, err := s.loadChapterStateLocked(folderName)
 	if err != nil || chapterState == nil {
 		s.chapterStateMu.Unlock()
 		http.Error(w, "No chapter state found", http.StatusNotFound)
@@ -2752,7 +2857,7 @@ func (s *Server) handleForceRedownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.saveChapterState(folderName, chapterState); err != nil {
+	if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
 		log.Printf("[FORCE-REDOWNLOAD] Failed to save chapter state before redownload: %v", err)
 	}
 	s.chapterStateMu.Unlock()
@@ -2795,7 +2900,7 @@ func (s *Server) forceRedownloadChapters(seriesID, folderName string, scr scrape
 	// chapter-state writers.
 	var chapterState *ChapterStateFile
 	s.chapterStateMu.Lock()
-	if st, err := s.loadChapterState(folderName); err == nil && st != nil {
+	if st, err := s.loadChapterStateLocked(folderName); err == nil && st != nil {
 		chapterState = st
 	}
 	s.chapterStateMu.Unlock()
@@ -2875,38 +2980,35 @@ func (s *Server) forceRedownloadChapters(seriesID, folderName string, scr scrape
 
 		s.chapterStateMu.Lock()
 		// Re-load under lock to merge concurrent writes before saving.
-		latestState, loadErr := s.loadChapterState(folderName)
+		latestState, loadErr := s.loadChapterStateLocked(folderName)
 		if loadErr == nil && latestState != nil {
 			latestState.Chapters[chapterKey] = chInfo
 			chapterState = latestState
 		}
-		if saveErr := s.saveChapterState(folderName, chapterState); saveErr != nil {
+		if saveErr := s.saveChapterStateLocked(folderName, chapterState); saveErr != nil {
 			log.Printf("[FORCE-REDOWNLOAD] Failed to save chapter state after %s: %v", chapterKey, saveErr)
 		}
 		s.chapterStateMu.Unlock()
 	}
 
-	// Update series stats
+	// Update series stats. chapterState may alias the cached object after the
+	// merge above, so count totals while chapterStateMu is held.
+	totalDownloaded := 0
+	s.chapterStateMu.Lock()
+	for _, c := range chapterState.Chapters {
+		if c.Downloaded {
+			totalDownloaded++
+		}
+	}
+	s.chapterStateMu.Unlock()
 	s.mu.Lock()
 	if sEntry, ok := s.series[seriesID]; ok {
-		totalDownloaded := 0
-		for _, c := range chapterState.Chapters {
-			if c.Downloaded {
-				totalDownloaded++
-			}
-		}
 		sEntry.ChaptersDownloaded = totalDownloaded
 		sEntry.UpdatedAt = time.Now()
 	}
 	s.mu.Unlock()
 
 	s.updateRegistryEntry(seriesID, func(e *RegistryEntry) {
-		totalDownloaded := 0
-		for _, c := range chapterState.Chapters {
-			if c.Downloaded {
-				totalDownloaded++
-			}
-		}
 		e.ChaptersDownloaded = totalDownloaded
 		e.UpdatedAt = time.Now()
 	})
@@ -2965,7 +3067,7 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 	}
 
 	s.chapterStateMu.Lock()
-	chapterState, err := s.loadChapterState(folderName)
+	chapterState, err := s.loadChapterStateLocked(folderName)
 	if err != nil || chapterState == nil {
 		s.chapterStateMu.Unlock()
 		http.Error(w, "No chapter state found", http.StatusNotFound)
@@ -2988,7 +3090,7 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 	chInfo.PerImageStatus = nil
 	chapterState.Chapters[chapterKey] = chInfo
 
-	if err := s.saveChapterState(folderName, chapterState); err != nil {
+	if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
 		log.Printf("[REDOWNLOAD-CHAPTER] Failed to save chapter state before redownload: %v", err)
 	}
 	s.chapterStateMu.Unlock()
@@ -3052,7 +3154,7 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 
 		if dl.Status == models.StatusCompleted || dl.Status == models.StatusPartial {
 			s.chapterStateMu.Lock()
-			latestState, loadErr := s.loadChapterState(folderName)
+			latestState, loadErr := s.loadChapterStateLocked(folderName)
 			if loadErr == nil && latestState != nil {
 				updated := latestState.Chapters[chapterKey]
 				updated.Downloaded = isDownloadComplete(dl)
@@ -3066,7 +3168,7 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 					updated.PerImageStatus = dl.PerImageStatus
 				}
 				latestState.Chapters[chapterKey] = updated
-				if saveErr := s.saveChapterState(folderName, latestState); saveErr != nil {
+				if saveErr := s.saveChapterStateLocked(folderName, latestState); saveErr != nil {
 					log.Printf("[REDOWNLOAD-CHAPTER] Failed to save chapter state: %v", saveErr)
 				}
 			}
@@ -3078,30 +3180,25 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 				return
 			}
 
+			// latestState aliases the cached object; count totals under the
+			// state lock so concurrent writers can't mutate during iteration.
+			totalDownloaded := 0
+			s.chapterStateMu.Lock()
+			for _, c := range latestState.Chapters {
+				if c.Downloaded {
+					totalDownloaded++
+				}
+			}
+			s.chapterStateMu.Unlock()
+
 			s.mu.Lock()
 			if sEntry, ok := s.series[seriesID]; ok {
-				totalDownloaded := 0
-				if latestState != nil {
-					for _, c := range latestState.Chapters {
-						if c.Downloaded {
-							totalDownloaded++
-						}
-					}
-				}
 				sEntry.ChaptersDownloaded = totalDownloaded
 				sEntry.UpdatedAt = time.Now()
 			}
 			s.mu.Unlock()
 
 			s.updateRegistryEntry(seriesID, func(e *RegistryEntry) {
-				totalDownloaded := 0
-				if latestState != nil {
-					for _, c := range latestState.Chapters {
-						if c.Downloaded {
-							totalDownloaded++
-						}
-					}
-				}
 				e.ChaptersDownloaded = totalDownloaded
 				e.UpdatedAt = time.Now()
 			})
@@ -3163,7 +3260,7 @@ func (s *Server) handleRecheckAllSeries(w http.ResponseWriter, r *http.Request) 
 		}
 
 		s.chapterStateMu.Lock()
-		chapterState, _ := s.loadChapterState(folderName)
+		chapterState, _ := s.loadChapterStateLocked(folderName)
 		if chapterState == nil {
 			// No state file — create from disk folders
 			chapterState = &ChapterStateFile{
@@ -3195,7 +3292,7 @@ func (s *Server) handleRecheckAllSeries(w http.ResponseWriter, r *http.Request) 
 					}
 				}
 			}
-			s.saveChapterState(folderName, chapterState)
+			s.saveChapterStateLocked(folderName, chapterState)
 		} else {
 			// State file exists — reconcile disk vs state
 			stateChanged := false
@@ -3236,18 +3333,20 @@ func (s *Server) handleRecheckAllSeries(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 			if stateChanged {
-				s.saveChapterState(folderName, chapterState)
+				s.saveChapterStateLocked(folderName, chapterState)
 			}
 		}
-		s.chapterStateMu.Unlock()
-
-		// Update in-memory series count
+		// Count totals while still holding the lock: chapterState may alias
+		// the cached object and writers may mutate it after we release.
 		totalDownloaded := 0
 		for _, c := range chapterState.Chapters {
 			if c.Downloaded {
 				totalDownloaded++
 			}
 		}
+		s.chapterStateMu.Unlock()
+
+		// Update in-memory series count
 		s.mu.Lock()
 		if sEntry, ok := s.series[series.ID]; ok {
 			sEntry.ChaptersDownloaded = totalDownloaded
@@ -3340,14 +3439,14 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	if _, err := os.Stat(chapterDir); err == nil {
 		os.RemoveAll(chapterDir)
 		s.chapterStateMu.Lock()
-		if state, loadErr := s.loadChapterState(folderName); loadErr == nil && state != nil {
+		if state, loadErr := s.loadChapterStateLocked(folderName); loadErr == nil && state != nil {
 			if chInfo, ok := state.Chapters[chapterKey]; ok {
 				chInfo.Downloaded = false
 				chInfo.ImageCount = 0
 				chInfo.DownloadedAt = time.Time{}
 				chInfo.PerImageStatus = nil
 				state.Chapters[chapterKey] = chInfo
-				s.saveChapterState(folderName, state)
+				s.saveChapterStateLocked(folderName, state)
 			}
 		}
 		s.chapterStateMu.Unlock()
@@ -3684,8 +3783,26 @@ func (s *Server) saveRegistry(registry *SeriesRegistry) error {
 	return nil
 }
 
-// loadChapterState loads the chapter state file from a series folder
+// loadChapterState returns the in-memory chapter state for a series folder,
+// reading the .chapters.json file from disk only on first access. It acquires
+// chapterStateMu itself; callers already holding the lock must call
+// loadChapterStateLocked instead.
 func (s *Server) loadChapterState(folderName string) (*ChapterStateFile, error) {
+	s.chapterStateMu.Lock()
+	defer s.chapterStateMu.Unlock()
+	return s.loadChapterStateLocked(folderName)
+}
+
+// loadChapterStateLocked is loadChapterState without locking. The returned
+// pointer aliases the cached object: callers mutating it must hold
+// chapterStateMu across the mutation (and any subsequent save) so the
+// write-on-change snapshot comparison is race-free.
+// Caller must hold chapterStateMu.
+func (s *Server) loadChapterStateLocked(folderName string) (*ChapterStateFile, error) {
+	if cached, ok := s.chapterStateCache[folderName]; ok {
+		return cached, nil
+	}
+
 	statePath := s.getChapterStatePath(folderName)
 
 	data, err := os.ReadFile(statePath)
@@ -3701,11 +3818,22 @@ func (s *Server) loadChapterState(folderName string) (*ChapterStateFile, error) 
 		return nil, fmt.Errorf("failed to unmarshal chapter state: %w", err)
 	}
 
+	s.chapterStateCache[folderName] = &state
 	return &state, nil
 }
 
-// saveChapterState saves the chapter state file to a series folder
+// saveChapterState persists the chapter state to disk only when its content
+// differs from the last persisted snapshot. It acquires chapterStateMu
+// itself; callers already holding the lock must call saveChapterStateLocked.
 func (s *Server) saveChapterState(folderName string, state *ChapterStateFile) error {
+	s.chapterStateMu.Lock()
+	defer s.chapterStateMu.Unlock()
+	return s.saveChapterStateLocked(folderName, state)
+}
+
+// saveChapterStateLocked is saveChapterState without locking.
+// Caller must hold chapterStateMu.
+func (s *Server) saveChapterStateLocked(folderName string, state *ChapterStateFile) error {
 	// Ensure the series directory exists before writing the chapter state file
 	seriesPath := filepath.Join(s.config.DownloadPath, folderName)
 	if err := os.MkdirAll(seriesPath, 0755); err != nil {
@@ -3719,12 +3847,23 @@ func (s *Server) saveChapterState(folderName string, state *ChapterStateFile) er
 		return fmt.Errorf("failed to marshal chapter state: %w", err)
 	}
 
+	if prev, ok := s.chapterStateCache[folderName]; ok && prev != state {
+		prevData, err := json.MarshalIndent(prev, "", "  ")
+		if err == nil && bytes.Equal(prevData, data) {
+			// Content unchanged -- skip the disk write. Update the cache entry
+			// to alias the caller's object so future mutations are detected.
+			s.chapterStateCache[folderName] = state
+			return nil
+		}
+	}
+
 	// WriteFileAtomic: temp + rename so a crash mid-write can't truncate
 	// .chapters.json and a concurrent unlocked reader never sees a partial file.
 	if err := fileutil.WriteFileAtomic(statePath, data, 0644); err != nil {
 		return err
 	}
 
+	s.chapterStateCache[folderName] = state
 	return nil
 }
 
@@ -3993,8 +4132,20 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 		folderName = series.Title
 	}
 
-	// Load chapter state from series folder
+	// Load chapter state from series folder. Copy it: the cache aliases the
+	// live object, and this function mutates its copy while unheld.
 	chapterState, err := s.loadChapterState(folderName)
+	if err == nil && chapterState != nil {
+		s.chapterStateMu.Lock()
+		cp := *chapterState
+		cp.Chapters = make(map[string]ChapterInfo, len(chapterState.Chapters))
+		for k, v := range chapterState.Chapters {
+			v.PerImageStatus = append([]models.ImageResult(nil), v.PerImageStatus...)
+			cp.Chapters[k] = v
+		}
+		chapterState = &cp
+		s.chapterStateMu.Unlock()
+	}
 	if err != nil {
 		log.Printf("Failed to load chapter state for %s: %v", seriesName, err)
 		return
@@ -4042,7 +4193,19 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 		folderName = series.Title
 	}
 
+	// Re-load + copy after refresh (locked read, private copy for mutation).
 	chapterState, err = s.loadChapterState(folderName)
+	if err == nil && chapterState != nil {
+		s.chapterStateMu.Lock()
+		cp := *chapterState
+		cp.Chapters = make(map[string]ChapterInfo, len(chapterState.Chapters))
+		for k, v := range chapterState.Chapters {
+			v.PerImageStatus = append([]models.ImageResult(nil), v.PerImageStatus...)
+			cp.Chapters[k] = v
+		}
+		chapterState = &cp
+		s.chapterStateMu.Unlock()
+	}
 	if err != nil {
 		log.Printf("Failed to load chapter state after refresh for %s: %v", seriesName, err)
 		return
@@ -4161,7 +4324,7 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 
 	if needsReset {
 		s.chapterStateMu.Lock()
-		latestState, loadErr := s.loadChapterState(folderName)
+		latestState, loadErr := s.loadChapterStateLocked(folderName)
 		if loadErr == nil && latestState != nil {
 			for chapterKey, chInfo := range chapterState.Chapters {
 				if !chInfo.Downloaded {
@@ -4170,7 +4333,7 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 			}
 			chapterState = latestState
 		}
-		s.saveChapterState(folderName, chapterState)
+		s.saveChapterStateLocked(folderName, chapterState)
 		s.chapterStateMu.Unlock()
 	}
 
@@ -4280,13 +4443,13 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 
 			s.chapterStateMu.Lock()
 			// Re-load under lock to merge any concurrent writes from updateChapterState
-			latestState, loadErr := s.loadChapterState(folderName)
+			latestState, loadErr := s.loadChapterStateLocked(folderName)
 			if loadErr == nil && latestState != nil {
 				// Apply our change on top of the latest saved state
 				latestState.Chapters[chapterKey] = chInfo
 				chapterState = latestState
 			}
-			if err := s.saveChapterState(folderName, chapterState); err != nil {
+			if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
 				log.Printf("Failed to save chapter state after downloading %s (%s): %v", chapter.Title, seriesName, err)
 			}
 			s.chapterStateMu.Unlock()
@@ -4413,10 +4576,21 @@ const indexHTML = `<!DOCTYPE html>
                 <div class="card">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
                         <h2 style="margin: 0;">Your Series</h2>
-                        <div style="display: flex; gap: 0.5rem;">
-                            <button class="btn btn-success" onclick="syncAllSeries()" title="Download missing chapters for all series">Sync All</button>
-                            <button class="btn btn-secondary" onclick="recheckAllSeries()" title="Scan all series folders and update download status">Recheck All</button>
-                        </div>
+                        <div style="display: flex; gap: 0.5rem; align-items: center;">
+					<label for="bulk-manga-interval" class="help-text" style="margin: 0;">Rescan all:</label>
+					<select id="bulk-manga-interval" class="interval-select" onchange="bulkSetInterval('manga', this.value); this.selectedIndex = 0;" title="Set rescan interval for all series except those set to Never">
+						<option value="">Choose...</option>
+						<option value="5m">Every 5 minutes</option>
+						<option value="15m">Every 15 minutes</option>
+						<option value="30m">Every 30 minutes</option>
+						<option value="1h">Every hour</option>
+						<option value="6h">Every 6 hours</option>
+						<option value="12h">Every 12 hours</option>
+						<option value="24h">Every 24 hours</option>
+					</select>
+					<button class="btn btn-success" onclick="syncAllSeries()" title="Download missing chapters for all series">Sync All</button>
+					<button class="btn btn-secondary" onclick="recheckAllSeries()" title="Scan all series folders and update download status">Recheck All</button>
+				</div>
                     </div>
                     <div id="series-list" class="series-list">
                         <p class="empty">No series added yet.</p>
@@ -4455,11 +4629,22 @@ const indexHTML = `<!DOCTYPE html>
                 <div class="card">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
                         <h2 style="margin: 0;">Your Artists</h2>
-                        <div style="display: flex; gap: 0.5rem;">
-                            <button class="btn btn-warning" onclick="checkAllHMArtists()" title="Check all artists for new books now">Check All</button>
-                            <button class="btn btn-success" onclick="syncAllHMArtists()" title="Download missing books for all artists">Sync All</button>
-                            <button class="btn btn-secondary" onclick="cleanupHMZips()" title="Rename existing ZIPs per the configured name regex and extract them if extraction is enabled">Clean Up Zips</button>
-                        </div>
+                        <div style="display: flex; gap: 0.5rem; align-items: center;">
+					<label for="bulk-hmanga-interval" class="help-text" style="margin: 0;">Rescan all:</label>
+					<select id="bulk-hmanga-interval" class="interval-select" onchange="bulkSetInterval('hmanga', this.value); this.selectedIndex = 0;" title="Set rescan interval for all artists except those set to Never">
+						<option value="">Choose...</option>
+						<option value="5m">Every 5 minutes</option>
+						<option value="15m">Every 15 minutes</option>
+						<option value="30m">Every 30 minutes</option>
+						<option value="1h">Every hour</option>
+						<option value="6h">Every 6 hours</option>
+						<option value="12h">Every 12 hours</option>
+						<option value="24h">Every 24 hours</option>
+					</select>
+					<button class="btn btn-warning" onclick="checkAllHMArtists()" title="Check all artists for new books now">Check All</button>
+					<button class="btn btn-success" onclick="syncAllHMArtists()" title="Download missing books for all artists">Sync All</button>
+					<button class="btn btn-secondary" onclick="cleanupHMZips()" title="Rename existing ZIPs per the configured name regex and extract them if extraction is enabled">Clean Up Zips</button>
+				</div>
                     </div>
                     <div id="hmanga-list" class="series-list">
                         <p class="empty">No artists added yet.</p>
@@ -6344,6 +6529,30 @@ async function removeHMArtist(artistId, artistName) {
     } catch (err) {
         showToast('Network error', 'error');
     }
+}
+
+// Bulk-set rescan interval for a whole section. The backend skips items
+// set to Never, so explicit opt-outs are preserved.
+async function bulkSetInterval(section, interval) {
+	if (!interval) return;
+	const url = section === 'manga' ? '/api/series/bulk-check-interval' : '/api/hmanga/artists/bulk-check-interval';
+	try {
+		const response = await fetch(url, {
+			method: 'PUT',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ checkInterval: interval })
+		});
+		if (response.ok) {
+			const result = await response.json();
+			showToast('Rescan interval set to ' + getIntervalDisplay(interval) + ' for ' + result.updated + ' item(s) (Never excluded)', 'success');
+			if (section === 'manga') loadSeries(); else loadHMArtists();
+		} else {
+			const error = await response.text();
+			showToast('Error: ' + error, 'error');
+		}
+	} catch (err) {
+		showToast('Network error', 'error');
+	}
 }
 
 // Update check interval
