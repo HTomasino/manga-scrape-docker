@@ -99,5 +99,29 @@ func ensureXvfb() error {
 		return fmt.Errorf("Xvfb started on %s but the socket never appeared", display)
 	}
 	log.Printf("[XVFB] Xvfb ready on %s (pid %d)", display, cmd.Process.Pid)
+
+	// When running as root (docker exec defaults to the image user), the
+	// Xvfb artifacts are root-owned and the pwuser entrypoint cannot
+	// remove them on the next boot (sticky /tmp). Chown them to the
+	// configured runtime user so cleanup keeps working.
+	if uid == 0 {
+		puid := "1000"
+		if v := os.Getenv("PUID"); v != "" {
+			puid = v
+		}
+		pgid := "1000"
+		if v := os.Getenv("PGID"); v != "" {
+			pgid = v
+		}
+		if uidN, uerr := strconv.Atoi(puid); uerr == nil {
+			gidN, gerr := strconv.Atoi(pgid)
+			if gerr != nil {
+				gidN = uidN
+			}
+			if serr := os.Chown(sockPath, uidN, gidN); serr == nil {
+				_ = os.Chown(lockPath, uidN, gidN)
+			}
+		}
+	}
 	return nil
 }

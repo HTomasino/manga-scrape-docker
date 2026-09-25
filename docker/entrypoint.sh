@@ -41,7 +41,7 @@ if [ -f "$XLOCK" ]; then
         echo "[XVFB] Reusing already-running Xvfb on :${DISPLAY_NUM} (pid $XPID)"
     else
         echo "[XVFB] Removing stale display artifacts (lock pid: ${XPID:-none})"
-        rm -f "$XLOCK" "$XSOCKET"
+        rm -f "$XLOCK" "$XSOCKET" 2>/dev/null || true
     fi
 fi
 
@@ -49,12 +49,14 @@ fi
 # its lock, so remove the orphaned socket before starting.
 if [ -e "$XSOCKET" ] && [ ! -f "$XLOCK" ]; then
     echo "[XVFB] Removing orphaned socket (no lock file)"
-    rm -f "$XSOCKET"
+    rm -f "$XSOCKET" 2>/dev/null || true
 fi
 
+XVFB_PID=""
 if ! [ -e "$XSOCKET" ]; then
     echo "[XVFB] starting on :${DISPLAY_NUM}"
     Xvfb ":${DISPLAY_NUM}" -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 &
+    XVFB_PID=$!
     # Wait for the socket so the first browser launch cannot beat Xvfb.
     XREADY=0
     for _ in $(seq 1 50); do
@@ -68,10 +70,42 @@ if ! [ -e "$XSOCKET" ]; then
     fi
 fi
 
-# If the first argument is "web" (or no argument), start the web server
+# If the first argument is "web" (or no argument), run the web server as a
+# direct child of this shell. This shell stays as PID 1: bash reaps every
+# child it waits on (including orphans reparented to PID 1, e.g. Chrome
+# crashpad helpers left by the Playwright node driver), so chrome crashes do
+# not pile up as <defunct> entries the way they do when a Go binary is PID 1.
+# SIGTERM/SIGINT (docker stop) is forwarded to the server; the server's
+# SCRAPE_SHUTDOWN_TIMEOUT_SECONDS grace applies before Docker's SIGKILL.
+# The Go-side ensureXvfb() respawn is still used when Xvfb dies mid-run.
+SERVER_PID=""
+terminate() {
+    echo "[ENTRYPOINT] Received stop signal; forwarding to children"
+    if [ -n "$SERVER_PID" ]; then
+        kill -TERM "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "$XVFB_PID" ]; then
+        kill -TERM "$XVFB_PID" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap terminate TERM INT
+
 if [ "$#" -eq 0 ] || [ "$1" = "web" ]; then
     shift || true
-    exec /usr/local/bin/comic-scraper-web "$@"
+    /usr/local/bin/comic-scraper-web "$@" &
+    SERVER_PID=$!
+    # Wait on the server; bash reaps reparented orphans between waits.
+    wait "$SERVER_PID"
+    EXIT_CODE=$?
+    # Propagate the server's exit code so docker restart policies behave.
+    if [ -n "$XVFB_PID" ]; then
+        kill -TERM "$XVFB_PID" 2>/dev/null || true
+    fi
+    exit "$EXIT_CODE"
 fi
 
-exec "$@"
+# CLI/other mode: hand off completely (bash execs the command; Xvfb stays
+# as a shell child and is reaped by bash when it exits).
+"$@"
