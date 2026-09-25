@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/playwright-community/playwright-go"
@@ -444,6 +445,64 @@ func defaultUserDataDir() string {
 	return filepath.Join(home, ".cache", UserDataDirName)
 }
 
+// chromeProbeResult caches the system-Chrome availability decision for the
+// process lifetime. Playwright's channel probe fails noisily on every launch
+// in containers (no /opt/google/chrome/chrome) and its "Run npx playwright
+// install chrome" hint reads like a redownload loop; probing the real
+// executable paths ourselves avoids both.
+var chromeProbeState atomic.Pointer[bool]
+
+// systemChromePaths lists the well-known system Chrome install locations,
+// checked before falling back to Playwright's channel probing.
+var systemChromePaths = []string{
+	"/usr/bin/google-chrome",
+	"/usr/bin/google-chrome-stable",
+	"/usr/bin/chromium",
+	"/usr/bin/chromium-browser",
+	"/opt/google/chrome/chrome",
+}
+
+// systemChromeAvailable reports whether a system Chrome binary exists. The
+// check runs at most once per process (paths are static for a running
+// container); the result is cached so repeated launches stay quiet and fast.
+func systemChromeAvailable() bool {
+	if cached := chromeProbeState.Load(); cached != nil {
+		return *cached
+	}
+	found := false
+	for _, p := range systemChromePaths {
+		if _, err := os.Stat(p); err == nil {
+			found = true
+			break
+		}
+	}
+	// Windows: Playwright's "chrome" channel resolves via the registry; the
+	// standard install path is a good enough signal.
+	if runtime.GOOS == "windows" && !found {
+		programFiles := os.Getenv("ProgramFiles")
+		if programFiles != "" {
+			if _, err := os.Stat(filepath.Join(programFiles, "Google", "Chrome", "Application", "chrome.exe")); err == nil {
+				found = true
+			}
+		}
+	}
+	// Multiple browser sessions can launch concurrently (manga + H-Manga);
+	// both may probe and store — same value either way, and Store is atomic.
+	chromeProbeState.Store(&found)
+	if !found {
+		log.Println("[BROWSER-QUEUE] System Chrome not installed; using Playwright Chromium (this is the expected container path)")
+	}
+	return found
+}
+
+// markSystemChromeUnavailable flips the cached probe result when a launch
+// that passed the file probe still fails (e.g. a broken install), so
+// subsequent launches skip the retry instead of re-failing every time.
+func markSystemChromeUnavailable() {
+	f := false
+	chromeProbeState.Store(&f)
+}
+
 // LaunchPersistentContextAt launches a persistent Chrome context at an explicit
 // user-data directory. Use this when you need a profile separate from the manga
 // profile (e.g. the H-Manga subsystem). It uses the identical launch flags as
@@ -456,12 +515,24 @@ func LaunchPersistentContextAt(pw *playwright.Playwright, cfg Config, userDataDi
 	// reports ERR_NAME_NOT_RESOLVED on first navigation.
 	cleanOrphanChrome(userDataDir)
 
+	var context playwright.BrowserContext
+	var err error
+
 	chromeArgs := []string{
 		"--disable-blink-features=AutomationControlled",
 		"--disable-features=AutomationControlled",
 		"--disable-infobars",
 		"--no-first-run",
 		"--no-default-browser-check",
+	}
+
+	// Chrome's renderer sandbox needs user namespaces, which Docker's default
+	// seccomp profile denies (errno = Operation not permitted). The challenge
+	// JS on stricter Cloudflare sites silently fails inside that broken
+	// sandbox, so disable it on Linux -- the standard practice for
+	// containerized Chrome.
+	if runtime.GOOS == "linux" {
+		chromeArgs = append(chromeArgs, "--no-sandbox", "--disable-dev-shm-usage")
 	}
 
 	if cfg.Background {
@@ -485,19 +556,52 @@ func LaunchPersistentContextAt(pw *playwright.Playwright, cfg Config, userDataDi
 		DownloadsPath:   playwright.String(downloadsDir),
 	}
 
-	log.Printf("[%s] Launching system Chrome (channel: chrome) with persistent profile: %s", logPrefix, userDataDir)
-	opts.Channel = playwright.String("chrome")
-	context, err := pw.Chromium.LaunchPersistentContext(userDataDir, opts)
-	if err != nil {
-		log.Printf("[%s] System Chrome not found, falling back to Playwright Chromium: %v", logPrefix, err)
+	// Probe for system Chrome once per process. Playwright's channel probe
+	// ("chrome is not found at /opt/google/chrome/chrome") fires on EVERY
+	// launch attempt and, when the subsequent launch also fails, Playwright
+	// prints its "Run npx playwright install chrome" banner — which reads
+	// like it is redownloading the browser on every scrape. Caching the
+	// probe result keeps the log to a single line per process and skips the
+	// doomed attempt entirely.
+	if systemChromeAvailable() {
+		log.Printf("[%s] Launching system Chrome (channel: chrome) with persistent profile: %s", logPrefix, userDataDir)
+		opts.Channel = playwright.String("chrome")
+		context, err = pw.Chromium.LaunchPersistentContext(userDataDir, opts)
+		if err != nil {
+			log.Printf("[%s] System Chrome probe passed but launch failed, falling back to Playwright Chromium: %v", logPrefix, err)
+			markSystemChromeUnavailable()
+		} else {
+			log.Printf("[%s] Running with system Chrome", logPrefix)
+		}
+	}
+
+	if context == nil {
 		opts.Channel = nil
 		context, err = pw.Chromium.LaunchPersistentContext(userDataDir, opts)
 		if err != nil {
 			return nil, fmt.Errorf("failed to launch browser: %w", err)
 		}
-		log.Printf("[%s] Running with Playwright Chromium fallback", logPrefix)
-	} else {
-		log.Printf("[%s] Running with system Chrome", logPrefix)
+		log.Printf("[%s] Running with Playwright Chromium", logPrefix)
+	}
+
+	// Stealth overrides for every page loaded in this context. Cloudflare's
+	// managed challenge reads navigator.webdriver and bails into a retry
+	// loop when it is true (console shows "No available adapters" + NaN
+	// errors, then the page never resolves). Playwright sets webdriver=true
+	// by default; override it plus a few hardware signals via an init
+	// script that runs before any page script.
+	initScript := `
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {
+  get: () => [1, 2, 3, 4, 5],
+});
+Object.defineProperty(navigator, 'languages', {
+  get: () => ['en-US', 'en'],
+});
+window.chrome = window.chrome || { runtime: {} };
+`
+	if err := context.AddInitScript(playwright.Script{Content: &initScript}); err != nil {
+		log.Printf("[%s] Warning: failed to add stealth init script: %v", logPrefix, err)
 	}
 
 	// Record the Chrome PID so a future launch can clean up orphans if this

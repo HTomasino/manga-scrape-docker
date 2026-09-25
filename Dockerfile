@@ -28,14 +28,35 @@ ENV DEBIAN_FRONTEND=noninteractive
 # because the /builds/driver CDN used by playwright-go's `playwright install`
 # is deprecated and now 404s for 1.57.0 (see playwright-go issue #593).
 ENV PLAYWRIGHT_DRIVER_PATH=/opt/ms-playwright-go
+# Default X display for the headed (non-headless) scraper browser. The
+# entrypoint starts Xvfb on this display for every mode — including `docker
+# exec` sessions, which inherit container ENV (not entrypoint shell exports).
+ENV DISPLAY=:99
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
+    libgl1-mesa-dri \
+    libglx-mesa0 \
     fonts-liberation \
     fonts-noto-color-emoji \
     curl \
     gosu \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Install real Google Chrome. Cloudflare's managed challenge on some sites
+# (en-thunderscans.com) fingerprint-blocks the Playwright Chromium build but
+# passes real Chrome; the scraper prefers system Chrome via channel "chrome"
+# and only falls back to bundled Chromium when it is absent.
+RUN set -eux; \
+    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+      | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg; \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+      > /etc/apt/sources.list.d/google-chrome.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends google-chrome-stable; \
+    rm -rf /var/lib/apt/lists/*; \
+    google-chrome --version
 
 # Assemble the playwright-go driver in the required layout:
 #   /opt/ms-playwright-go/node            <- node binary (MCR image ships one at /usr/bin/node)

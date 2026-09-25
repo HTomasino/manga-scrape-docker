@@ -4,7 +4,7 @@ Run Comic Scraper as a Docker container with automatic updates via
 **Watchtower** (CI-built GHCR image) and full documentation for pointing the
 scrapers at **network drives** (SMB/NFS).
 
-- Image: `ghcr.io/htomasino/manga-scrape-docker` (linux/amd64)
+- Image: `ghcr.io/htomasino/webscraper` (linux/amd64)
 - Ships both binaries: the web server (`comic-scraper-web`) and the CLI
   (`comic-scraper-cli`, usable via `docker exec`)
 - Headed Chrome under **Xvfb** — scraping works exactly as on a desktop,
@@ -51,8 +51,8 @@ normal container path).
 ## Quick Start
 
 ```bash
-git clone https://github.com/HTomasino/manga-scrape-docker manga-scrape-docker
-cd manga-scrape-docker
+git clone https://github.com/HTomasino/Webscraper webscraper
+cd webscraper
 docker compose up -d
 ```
 
@@ -116,7 +116,7 @@ The update loop:
 
 1. You push to `master` (or a `v*` tag).
 2. GitHub Actions builds the image and pushes it to GHCR
-   (`ghcr.io/htomasino/manga-scrape-docker:latest` for master, semver tags for releases).
+   (`ghcr.io/htomasino/webscraper:latest` for master, semver tags for releases).
 3. The `watchtower` sidecar polls GHCR every 5 minutes
    (`WATCHTOWER_POLL_INTERVAL=300`), compares the remote digest with the
    running container's, and **recreates the container** on a new digest.
@@ -387,3 +387,5 @@ state-changing requests with 403 (the UI loads, but every action fails).
 | CIFS rename/permission errors in logs | Some servers reject rename-based atomic writes with specific option sets; add `noserverino`, ensure `file_mode`/`dir_mode` allow write, or switch to the host-mount approach. |
 | Slow startup with H-Manga on a share | Set `verifyHMDownloads: false` in `config.json` to skip the disk verification scan. |
 | Downloads killed at 10 minutes during updates | `SCRAPE_SHUTDOWN_TIMEOUT_SECONDS` exceeds `stop_grace_period`; raise both (compose default grace is 15m). |
+| ThunderScans scrape fails with "Cloudflare challenge did not resolve ... device-attestation" | en-thunderscans.com enforces Cloudflare Private Access Token (device attestation) challenges that a Linux container cannot pass — the challenge page 401s on the `/pat/` endpoint and the title stays "Just a moment..." forever. Sites using plain JS challenges (AsuraScans, DrakeComic, ManhuaUS) pass fine. Scrape ThunderScans series from a native Windows install, or wait for Cloudflare/site rules to change. |
+| "System Chrome not installed; using Playwright Chromium" in every container log line | Informational, logged once per process. The image now installs real Google Chrome (used when present); this line appears only if Chrome was removed at runtime. |

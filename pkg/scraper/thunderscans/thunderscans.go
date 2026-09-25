@@ -4,14 +4,17 @@ import (
 	"encoding/json"
 	"html"
 	"log"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/user/comic-scraper/pkg/models"
 	"github.com/user/comic-scraper/pkg/scraper"
+	"github.com/user/comic-scraper/pkg/scraper/browser"
 )
 
 var (
@@ -21,6 +24,8 @@ var (
 
 var thunderscansCDNDomains = []string{
 	"en-thunderscans.com",
+	"thunderscans.com",
+	"i0.wp.com", // WordPress CDN proxy used by some chapter images
 }
 
 type tsReaderConfig struct {
@@ -32,14 +37,66 @@ type tsReaderSource struct {
 	Images []string `json:"images"`
 }
 
-type Scraper struct{}
+// Scraper implements BrowserFetcher and CookieProvider for ThunderScans.
+// Cloudflare fronts en-thunderscans.com with a JS challenge that the plain
+// HTTP client cannot pass (HTTP 403 + Cf-Mitigated: challenge), so page
+// fetches go through Playwright. Cookies and User-Agent from the solved
+// session are cached for image downloads — Cloudflare ties cf_clearance to
+// the User-Agent that solved the challenge.
+type BrowserConfig = browser.Config
+
+type Scraper struct {
+	cookies      []*http.Cookie
+	userAgent    string
+	mu           sync.Mutex
+	browserCfg   BrowserConfig
+	browserQueue *browser.Queue
+}
 
 func NewScraper() *Scraper {
 	return &Scraper{}
 }
 
+func NewScraperWithPlaywright(cfg BrowserConfig, q *browser.Queue) *Scraper {
+	return &Scraper{browserCfg: cfg, browserQueue: q}
+}
+
 func (s *Scraper) Name() string {
 	return models.SiteThunderscans
+}
+
+// FetchHTML routes page fetches through Playwright to pass the Cloudflare
+// challenge, mirroring the DrakeComic implementation.
+func (s *Scraper) FetchHTML(url string) (string, error) {
+	log.Printf("[THUNDERSCANS-FETCH] Using Playwright to bypass Cloudflare for: %s", url)
+	html, cookies, userAgent, err := FetchWithPlaywright(url, s.browserCfg, s.browserQueue)
+	if err != nil {
+		return "", err
+	}
+
+	// Cache cookies and User-Agent for subsequent image downloads
+	s.mu.Lock()
+	s.cookies = cookies
+	s.userAgent = userAgent
+	s.mu.Unlock()
+
+	return html, nil
+}
+
+// GetCookies returns the Cloudflare cookies from the last Playwright session.
+// These must be injected into the HTTP client for image downloads to succeed.
+func (s *Scraper) GetCookies() []*http.Cookie {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cookies
+}
+
+// GetUserAgent returns the User-Agent that was used in the Playwright session.
+// Cloudflare ties cf_clearance to the UA that solved the challenge.
+func (s *Scraper) GetUserAgent() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.userAgent
 }
 
 func (s *Scraper) CanHandle(pageURL string) bool {

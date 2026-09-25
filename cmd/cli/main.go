@@ -81,7 +81,7 @@ func main() {
 	registry.Register(lua.NewScraper())
 	registry.Register(manhuaus.NewScraperWithPlaywright(browserCfg, browserQueue))
 	registry.Register(manhuaplus.NewScraper(httpClient))
-	registry.Register(thunderscans.NewScraper())
+	registry.Register(thunderscans.NewScraperWithPlaywright(browserCfg, browserQueue))
 	registry.Register(ravenscans.NewScraper())
 
 	// Determine store path

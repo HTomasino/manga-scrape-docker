@@ -20,17 +20,26 @@ if [ "$(id -u)" -eq 0 ] && [ -w "$DATA_DIR" ]; then
     exec gosu "$PUID:$PGID" /usr/local/bin/entrypoint.sh "$@"
 fi
 
-# If the first argument is "web" (or no argument), start the web server under Xvfb
+# Start Xvfb for ALL modes (web server, CLI exec sessions). The scraper is
+# headed (Headless:false) and needs a display; docker exec sessions inherit
+# DISPLAY from the container ENV (set to :99 in the Dockerfile), which only
+# works if Xvfb is actually running on :99 regardless of entrypoint mode.
+if [ -z "$DISPLAY" ]; then
+    export DISPLAY=":99"
+fi
+DISPLAY_NUM="${DISPLAY#:}"
+if ! [ -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ] && [ ! -f "/tmp/.X${DISPLAY_NUM}-lock" ]; then
+    Xvfb ":${DISPLAY_NUM}" -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 &
+    # Wait for the socket so the first browser launch cannot beat Xvfb.
+    for _ in $(seq 1 50); do
+        [ -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ] && break
+        sleep 0.1
+    done
+fi
+
+# If the first argument is "web" (or no argument), start the web server
 if [ "$#" -eq 0 ] || [ "$1" = "web" ]; then
     shift || true
-    # Start Xvfb on a free display so the Go server becomes PID 1 and receives
-    # SIGTERM properly. Container-local unix socket only, so no xauth needed.
-    DISPLAY_NUM=99
-    while [ -f "/tmp/.X${DISPLAY_NUM}-lock" ]; do
-        DISPLAY_NUM=$((DISPLAY_NUM + 1))
-    done
-    Xvfb ":${DISPLAY_NUM}" -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 &
-    export DISPLAY=":${DISPLAY_NUM}"
     exec /usr/local/bin/comic-scraper-web "$@"
 fi
 
