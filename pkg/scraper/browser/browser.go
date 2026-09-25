@@ -288,6 +288,13 @@ func (q *Queue) closeContext() {
 // directly.  If a previous creation attempt failed recently, a cooldown
 // period is enforced to avoid rapid retry loops.
 func (q *Queue) ensureContext() (playwright.BrowserContext, error) {
+	// Verify the display server is up before creating a context: a crashed
+	// Xvfb (container) previously left the browser unusable until restart.
+	// Cheap unix-socket connect on Linux; no-op elsewhere.
+	if err := ensureXvfb(); err != nil {
+		return nil, fmt.Errorf("display server unavailable: %w", err)
+	}
+
 	q.pwMu.Lock()
 	if q.pw == nil {
 		pw, err := playwright.Run()

@@ -4469,6 +4469,10 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 }
 
 func main() {
+	// Reap orphaned chrome/node children so they don't pile up as zombies
+	// when the server is PID 1.
+	startZombieReaper()
+
 	background := flag.Bool("d", false, "Run in background (detached from terminal)")
 	flag.Parse()
 

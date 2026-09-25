@@ -28,13 +28,44 @@ if [ -z "$DISPLAY" ]; then
     export DISPLAY=":99"
 fi
 DISPLAY_NUM="${DISPLAY#:}"
-if ! [ -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ] && [ ! -f "/tmp/.X${DISPLAY_NUM}-lock" ]; then
+XLOCK="/tmp/.X${DISPLAY_NUM}-lock"
+XSOCKET="/tmp/.X11-unix/X${DISPLAY_NUM}"
+
+# A lock file from a previous container boot (docker restart keeps the
+# filesystem) must not suppress Xvfb startup: verify the recorded PID is
+# alive AND is actually Xvfb before trusting it; otherwise remove the
+# stale lock and socket.
+if [ -f "$XLOCK" ]; then
+    XPID=$(cat "$XLOCK" 2>/dev/null | tr -dc "0-9")
+    if [ -n "$XPID" ] && [ -d "/proc/$XPID" ] && grep -qx "Xvfb" "/proc/$XPID/comm" 2>/dev/null; then
+        echo "[XVFB] Reusing already-running Xvfb on :${DISPLAY_NUM} (pid $XPID)"
+    else
+        echo "[XVFB] Removing stale display artifacts (lock pid: ${XPID:-none})"
+        rm -f "$XLOCK" "$XSOCKET"
+    fi
+fi
+
+# A socket without a lock file is stale: a live Xvfb always maintains
+# its lock, so remove the orphaned socket before starting.
+if [ -e "$XSOCKET" ] && [ ! -f "$XLOCK" ]; then
+    echo "[XVFB] Removing orphaned socket (no lock file)"
+    rm -f "$XSOCKET"
+fi
+
+if ! [ -e "$XSOCKET" ]; then
+    echo "[XVFB] starting on :${DISPLAY_NUM}"
     Xvfb ":${DISPLAY_NUM}" -screen 0 1280x720x24 -nolisten tcp >/dev/null 2>&1 &
     # Wait for the socket so the first browser launch cannot beat Xvfb.
+    XREADY=0
     for _ in $(seq 1 50); do
-        [ -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ] && break
+        if [ -e "$XSOCKET" ]; then XREADY=1; break; fi
         sleep 0.1
     done
+    if [ "$XREADY" -eq 1 ]; then
+        echo "[XVFB] ready on :${DISPLAY_NUM}"
+    else
+        echo "[XVFB] WARNING: socket did not appear within 5s; browser launches may fail"
+    fi
 fi
 
 # If the first argument is "web" (or no argument), start the web server
