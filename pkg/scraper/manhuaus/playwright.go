@@ -18,8 +18,9 @@ const (
 
 // FetchWithPlaywright fetches a page using Playwright, routed through the
 // shared browser queue so that only one browser operation runs at a time.
-// The browser context is reused across calls — only a new tab (page) is
-// created and closed per request.
+// The operation reuses the queue's single persistent tab and navigates it in
+// place (page.Goto) — no new tab per request, so the Cloudflare session is
+// not churned by repeated page creation.
 func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (string, []*http.Cookie, string, error) {
 	log.Printf("[MANHUAUS-PLAYWRIGHT] Queuing browser request for: %s", pageURL)
 
@@ -27,22 +28,15 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 	var cookies []*http.Cookie
 	var userAgentStr string
 
-	err := q.Run(func(ctx playwright.BrowserContext) error {
+	err := q.RunWithPage(func(page playwright.Page) error {
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Executing browser request for: %s", pageURL)
-
-		page, err := ctx.NewPage()
-		if err != nil {
-			return err
-		}
-		defer page.Close()
 
 		page.SetDefaultTimeout(60000)
 
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Navigating to page...")
-		_, err = page.Goto(pageURL, playwright.PageGotoOptions{
+		if _, err := page.Goto(pageURL, playwright.PageGotoOptions{
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		})
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 
@@ -84,7 +78,7 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Browser User-Agent: %s", userAgentStr)
 
 		// Extract cookies from the browser context for reuse in HTTP requests
-		playwrightCookies, err := ctx.Cookies()
+		playwrightCookies, err := page.Context().Cookies()
 		if err != nil {
 			log.Printf("[MANHUAUS-PLAYWRIGHT] Warning: failed to extract cookies: %v", err)
 		}

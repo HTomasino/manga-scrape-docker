@@ -444,13 +444,7 @@ func (m *HentaiNexusManager) Login() error {
 		return errors.New("HentaiNexus credentials not configured")
 	}
 
-	return m.runOnQueue(func(ctx playwright.BrowserContext) error {
-		page, err := ctx.NewPage()
-		if err != nil {
-			return fmt.Errorf("new page: %w", err)
-		}
-		defer func() { defer func() { recover() }(); page.Close() }()
-
+	return m.browserQueue.RunWithPage(func(page playwright.Page) error {
 		// First check if already logged in.
 		if _, err := page.Goto("https://hentainexus.com/", playwright.PageGotoOptions{
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
@@ -526,13 +520,7 @@ func (m *HentaiNexusManager) ExtractBooks(artistURL string) ([]Book, error) {
 	defer func() { <-m.scrapeSem }()
 
 	var books []Book
-	err := m.runOnQueue(func(ctx playwright.BrowserContext) error {
-		page, err := ctx.NewPage()
-		if err != nil {
-			return fmt.Errorf("new page: %w", err)
-		}
-		defer func() { defer func() { recover() }(); page.Close() }()
-
+	err := m.browserQueue.RunWithPage(func(page playwright.Page) error {
 		seen := make(map[string]Book)
 		current := artistURL
 		for pageNum := 1; pageNum <= maxPagination; pageNum++ {

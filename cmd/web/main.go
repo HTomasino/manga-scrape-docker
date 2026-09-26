@@ -274,6 +274,18 @@ func NewServer() (*Server, error) {
 	// Create shared browser queue for serialising Playwright requests
 	browserQueue := browser.NewQueue(browser.Config{Background: cfg.BrowserBackground})
 
+	// Optional imported cookies (JSON array or Netscape cookies.txt) for
+	// sites whose Cloudflare challenge cannot pass in the container. The
+	// file is looked up in DATA_DIR/config (cookieFile) or the COOKIE_FILE
+	// env override; cookies are injected into every fresh browser context.
+	if path := cookieImportPath(); path != "" {
+		if _, err := browser.LoadCookieFile(path); err != nil {
+			log.Printf("[COOKIES] Warning: cookie file %s exists but failed to load: %v (falling back to normal challenge flow)", path, err)
+		}
+		browserQueue.SetCookieFile(path)
+		log.Printf("[COOKIES] Cookie import enabled: %s", path)
+	}
+
 	// Create scraper registry and register scrapers
 	browserCfg := browser.Config{Background: cfg.BrowserBackground}
 
@@ -4466,6 +4478,21 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 	}
 
 	log.Printf("Auto-download completed for series %s", seriesName)
+}
+
+// cookieImportPath returns the configured imported-cookie file path, or
+// an empty string when none is configured. Precedence: COOKIE_FILE env >
+// <configBaseDir>/cookies.json. A missing file is NOT an error — cookie
+// import is purely opt-in.
+func cookieImportPath() string {
+	if v := os.Getenv("COOKIE_FILE"); v != "" {
+		return v
+	}
+	p := filepath.Join(config.ConfigBaseDir(), "cookies.json")
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return ""
 }
 
 func main() {

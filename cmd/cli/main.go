@@ -43,6 +43,20 @@ type Commands struct {
 	storePath  string
 }
 
+// cookieImportPath returns the configured imported-cookie file path, or
+// an empty string when none is configured. Precedence: COOKIE_FILE env >
+// <configBaseDir>/cookies.json. A missing file is NOT an error -- cookie
+// import is purely opt-in.
+func cookieImportPath() string {
+	if v := os.Getenv("COOKIE_FILE"); v != "" {
+		return v
+	}
+	p := filepath.Join(config.ConfigBaseDir(), "cookies.json")
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return ""
+}
 func main() {
 	// Load configuration
 	cfg, err := config.Load()
@@ -72,6 +86,10 @@ func main() {
 	// Create scraper registry and register scrapers
 	browserCfg := browser.Config{Background: cfg.BrowserBackground}
 	browserQueue := browser.NewQueue(browserCfg)
+	if path := cookieImportPath(); path != "" {
+		browserQueue.SetCookieFile(path)
+		log.Printf("[COOKIES] Cookie import enabled: %s", path)
+	}
 	defer browserQueue.Stop()
 
 	registry := scraper.NewRegistry()

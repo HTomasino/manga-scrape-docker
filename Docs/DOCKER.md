@@ -374,6 +374,66 @@ state-changing requests with 403 (the UI loads, but every action fails).
 
 ---
 
+## Importing Browser Cookies (Cloudflare Escape Hatch)
+
+Some sites enforce Cloudflare challenges that a Linux container cannot pass
+(device-attestation / Private Access Token flows — the challenge page 401s on
+the `/pat/` endpoint and the title stays "Just a moment..." forever, e.g.
+en-thunderscans.com; some ManhuaUS deployments show the same pattern). For
+those, the scraper can import cookies from your local browser and use them
+directly, bypassing the challenge entirely — the same trick a browser
+extension does.
+
+### 1. Export cookies from your local browser
+
+Open the site in your desktop browser, solve the Cloudflare challenge once,
+then export its cookies with any cookie-export extension (e.g. **Get
+cookies.txt LOCALLY**). Two formats are accepted:
+
+- **JSON array** (the extension's JSON export): `[{"name": "cf_clearance",
+  "value": "...", "domain": ".manhuaus.com", ...}]`
+- **Netscape `cookies.txt`** (the classic tab-separated format, starts with
+  `# Netscape HTTP Cookie File`)
+
+### 2. Drop the file into the container
+
+Mount the file as `cookies.json` in the config directory (or point
+`COOKIE_FILE` at any path):
+
+```yaml
+services:
+  scraper:
+    environment:
+      - COOKIE_FILE=/data/config/cookies.txt
+    volumes:
+      - ./cookies.txt:/data/config/cookies.txt:ro
+```
+
+If no `COOKIE_FILE` is set, the app also looks for
+`<DATA_DIR>/config/cookies.json` automatically.
+
+### 3. Restart
+
+On every fresh browser context the cookies are injected
+(`[COOKIES] Injected N cookies from ...` in the logs) **before** any
+navigation, so the site sees your already-solved `cf_clearance` session
+instead of a fresh challenge. Combined with the persistent profile volume,
+the challenge is skipped entirely.
+
+Notes:
+
+- The cookie file is read on every context (re)creation, so you can update
+  it without restarting the container — just replace the mounted file.
+- Export **all** cookies for the site's domain (Cloudflare sets
+  `cf_clearance` and often `__cf_bm`); filtering to one cookie name is not
+  required.
+- Cookies expire (typically hours to days for `cf_clearance`). When they
+  expire the site falls back to the normal challenge flow; re-export fresh
+  cookies from your browser.
+- Cookie import does not affect the Chrome profile volume — it is additive.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause / Fix |

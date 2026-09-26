@@ -161,6 +161,18 @@ type Queue struct {
 	ctx   playwright.BrowserContext
 	ctxOk bool // true when ctx is known to be alive and usable
 
+	// page is a long-lived tab inside ctx. Operations that opt in reuse it
+	// via RunWithPage and navigate in place (page.Goto) instead of opening
+	// a new tab per item, which avoids re-triggering Cloudflare checks on
+	// every new page. Created lazily with the context, closed with it.
+	page playwright.Page
+
+	// cookieFile is the path of an optional imported-cookie file (JSON
+	// array or Netscape cookies.txt). When set, its cookies are injected
+	// into every newly created browser context — the escape hatch for
+	// sites whose Cloudflare challenge cannot pass in the container.
+	cookieFilePath string
+
 	// lastContextFail tracks when the last context creation attempt failed,
 	// used to enforce a cooldown between retries.
 	lastContextFail time.Time
@@ -246,6 +258,7 @@ func (q *Queue) processLoop() {
 				if q.ctx != nil {
 					log.Printf("[BROWSER-QUEUE] Context-closed error reported (%v); will re-create on next request", reqErr)
 					q.ctxOk = false
+					q.page = nil
 				}
 				q.ctxMu.Unlock()
 			}
@@ -271,6 +284,7 @@ func (q *Queue) closeContext() {
 	q.ctxMu.Lock()
 	defer q.ctxMu.Unlock()
 	if q.ctx != nil {
+		q.page = nil // page dies with the context
 		func() {
 			defer func() {
 				recover() // silently ignore panics from closing a dead context
@@ -333,6 +347,7 @@ func (q *Queue) ensureContext() (playwright.BrowserContext, error) {
 		}()
 		q.ctx = nil
 		q.ctxOk = false
+		q.page = nil
 	}
 
 	ctx, err := LaunchPersistentContext(pw, q.cfg, "BROWSER-QUEUE")
@@ -345,7 +360,77 @@ func (q *Queue) ensureContext() (playwright.BrowserContext, error) {
 	q.ctxOk = true
 	q.lastContextFail = time.Time{}
 	log.Printf("[BROWSER-QUEUE] Browser context opened")
+	q.applyCookieFile(ctx)
 	return ctx, nil
+}
+
+// ensurePage returns the persistent tab, creating it inside the context when
+// missing (first RunWithPage after context creation, or after the tab was
+// closed externally). Caller must hold ctxMu.
+func (q *Queue) ensurePage() (playwright.Page, error) {
+	if q.page != nil {
+		return q.page, nil
+	}
+	page, err := q.ctx.NewPage()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open persistent page: %w", err)
+	}
+	q.page = page
+	log.Printf("[BROWSER-QUEUE] Persistent page opened")
+	return page, nil
+}
+
+// RunWithPage enqueues a Playwright operation that reuses a single
+// long-lived tab instead of opening a new one per request. The callback
+// receives the persistent page and should navigate in place (page.Goto);
+// it must NOT close the page or the context. Operations still run one at a
+// time, so the shared page is never used concurrently.
+func (q *Queue) RunWithPage(fn func(page playwright.Page) error) error {
+	wrapped := func(ctx playwright.BrowserContext) error {
+		q.ctxMu.Lock()
+		page, perr := q.ensurePage()
+		q.ctxMu.Unlock()
+		if perr != nil {
+			return fmt.Errorf("persistent page unavailable: %w", perr)
+		}
+		return fn(page)
+	}
+	return q.Run(wrapped)
+}
+
+// SetCookieFile registers an imported-cookie file to inject into every
+// newly created browser context. Pass an empty path to disable. Takes
+// effect on the next context (re)creation; the current context keeps its
+// existing cookies.
+func (q *Queue) SetCookieFile(path string) {
+	q.ctxMu.Lock()
+	defer q.ctxMu.Unlock()
+	q.cookieFilePath = path
+}
+
+// applyCookieFile injects the imported cookies (when configured) into the
+// given context. Called from ensureContext on every fresh context so a
+// user-supplied cf_clearance etc. survives context recreation. Failures
+// are logged but non-fatal: a missing file or an expired cookie set
+// degrades to the normal challenge flow.
+func (q *Queue) applyCookieFile(ctx playwright.BrowserContext) {
+	path := q.cookieFilePath
+	if path == "" {
+		return
+	}
+	cookies, err := LoadCookieFile(path)
+	if err != nil {
+		log.Printf("[COOKIES] Failed to load %s: %v", path, err)
+		return
+	}
+	if len(cookies) == 0 {
+		return
+	}
+	if aerr := ctx.AddCookies(cookies); aerr != nil {
+		log.Printf("[COOKIES] Failed to inject %d cookies from %s: %v", len(cookies), path, aerr)
+		return
+	}
+	log.Printf("[COOKIES] Injected %d cookies from %s", len(cookies), path)
 }
 
 // Run enqueues a Playwright operation.  It blocks until the operation
@@ -389,6 +474,7 @@ func (q *Queue) Stop() {
 		// Close the persistent browser context.
 		q.ctxMu.Lock()
 		if q.ctx != nil {
+			q.page = nil
 			func() {
 				defer func() {
 					recover() // silently ignore panics from closing a dead context

@@ -21,8 +21,9 @@ const (
 // AsuraScans uses lazy loading for images, so this function scrolls the page
 // to trigger all image loads before returning the fully rendered content.
 //
-// The browser context is reused across calls — only a new tab (page) is
-// created and closed per request, keeping the browser window alive.
+// The operation reuses the queue's single persistent tab and navigates it in
+// place (page.Goto) — no new tab per request, so the Cloudflare session is
+// not churned by repeated page creation.
 func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (string, []*http.Cookie, string, error) {
 	log.Printf("[ASURA-PLAYWRIGHT] Queuing browser request for: %s", pageURL)
 
@@ -30,22 +31,15 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 	var cookies []*http.Cookie
 	var userAgentStr string
 
-	err := q.Run(func(ctx playwright.BrowserContext) error {
+	err := q.RunWithPage(func(page playwright.Page) error {
 		log.Printf("[ASURA-PLAYWRIGHT] Executing browser request for: %s", pageURL)
-
-		page, err := ctx.NewPage()
-		if err != nil {
-			return err
-		}
-		defer page.Close()
 
 		page.SetDefaultTimeout(60000)
 
 		log.Printf("[ASURA-PLAYWRIGHT] Navigating to page...")
-		_, err = page.Goto(pageURL, playwright.PageGotoOptions{
+		if _, err := page.Goto(pageURL, playwright.PageGotoOptions{
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		})
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 
@@ -95,7 +89,7 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 		log.Printf("[ASURA-PLAYWRIGHT] Browser User-Agent: %s", userAgentStr)
 
 		// Extract cookies from the browser context for reuse in HTTP requests
-		playwrightCookies, err := ctx.Cookies()
+		playwrightCookies, err := page.Context().Cookies()
 		if err != nil {
 			log.Printf("[ASURA-PLAYWRIGHT] Warning: failed to extract cookies: %v", err)
 			// Non-fatal — continue without cookies

@@ -65,48 +65,41 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 	var cookies []*http.Cookie
 	var userAgentStr string
 
-	err := q.Run(func(ctx playwright.BrowserContext) error {
+	err := q.RunWithPage(func(page playwright.Page) error {
 		log.Printf("[DRAKE-PLAYWRIGHT] Executing browser request for: %s", pageURL)
 
+		page.SetDefaultTimeout(60000)
+
 		// Retry transient DNS failures (e.g. Windows DNS resolver returning
-		// a stale NXDOMAIN, or Chromium's IPv6-first race) by re-creating the
-		// page on each attempt so a stuck connection from a prior navigation
-		// can't poison the next one. Uses exponential backoff (2s, 4s, 8s,
+		// a stale NXDOMAIN, or Chromium's IPv6-first race) by re-navigating
+		// in place on each attempt. Uses exponential backoff (2s, 4s, 8s,
 		// capped at dnsRetryMaxDelay) to outlast Windows' configurable
 		// negative-cache TTL -- a fixed delay would either be too short for
 		// pathological resolvers or waste time on a true outage.
-		var page playwright.Page
+		var navErr error
 		for attempt := 1; attempt <= dnsRetryAttempts; attempt++ {
-			p, err := ctx.NewPage()
-			if err != nil {
-				return err
-			}
-			p.SetDefaultTimeout(60000)
-
 			log.Printf("[DRAKE-PLAYWRIGHT] Navigating to page (attempt %d/%d)...", attempt, dnsRetryAttempts)
-			_, err = p.Goto(pageURL, playwright.PageGotoOptions{
+			if _, err := page.Goto(pageURL, playwright.PageGotoOptions{
 				WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-			})
-			if err == nil {
-				page = p
+			}); err == nil {
+				navErr = nil
 				break
+			} else {
+				navErr = err
 			}
 
-			// Always close the failed page before deciding whether to retry.
-			p.Close()
-
-			if !isTransientDNSError(err) || attempt == dnsRetryAttempts {
-				return err
+			if !isTransientDNSError(navErr) || attempt == dnsRetryAttempts {
+				return navErr
 			}
 			delay := dnsRetryBaseDelay * time.Duration(1<<(attempt-1))
 			if delay > dnsRetryMaxDelay || delay < 0 {
 				delay = dnsRetryMaxDelay
 			}
 			log.Printf("[DRAKE-PLAYWRIGHT] Transient DNS error on attempt %d/%d (%v); retrying in %v",
-				attempt, dnsRetryAttempts, err, delay)
+				attempt, dnsRetryAttempts, navErr, delay)
 			time.Sleep(delay)
 		}
-		defer page.Close()
+		_ = navErr
 
 		log.Printf("[DRAKE-PLAYWRIGHT] Waiting for Cloudflare challenge to resolve...")
 		deadline := time.Now().Add(cloudflareWaitTimeout)
@@ -146,7 +139,7 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 		log.Printf("[DRAKE-PLAYWRIGHT] Browser User-Agent: %s", userAgentStr)
 
 		// Extract cookies from the browser context for reuse in HTTP requests
-		playwrightCookies, err := ctx.Cookies()
+		playwrightCookies, err := page.Context().Cookies()
 		if err != nil {
 			log.Printf("[DRAKE-PLAYWRIGHT] Warning: failed to extract cookies: %v", err)
 			// Non-fatal — continue without cookies
