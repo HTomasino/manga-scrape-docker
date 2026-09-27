@@ -116,6 +116,7 @@ type Config struct {
 
 // request represents a single Playwright operation submitted to the Queue.
 type request struct {
+	key    string // dedupe key; empty disables dedupe for this request
 	fn     func(ctx playwright.BrowserContext) error
 	result chan error
 }
@@ -186,6 +187,13 @@ type Queue struct {
 	// used to enforce a cooldown between retries.
 	lastContextFail time.Time
 
+	// keyedRequests tracks queued or in-flight requests by their dedupe key
+	// so identical operations (same key) share one execution instead of
+	// being enqueued twice. A second caller with the same key waits on the
+	// original request's result channel. Guarded by keyedMu.
+	keyedMu      sync.Mutex
+	keyedWaiting map[string][]chan error
+
 	// inflight tracks in-flight requests so Stop() can wait for them
 	// to complete before closing the context.
 	inflight      sync.WaitGroup
@@ -201,9 +209,10 @@ type Queue struct {
 // first call to Run and automatically closed after idleTimeout of inactivity.
 func NewQueue(cfg Config) *Queue {
 	q := &Queue{
-		cfg:   cfg,
-		reqch: make(chan request),
-		done:  make(chan struct{}),
+		cfg:          cfg,
+		reqch:        make(chan request),
+		done:         make(chan struct{}),
+		keyedWaiting: make(map[string][]chan error),
 	}
 	go q.processLoop()
 	return q
@@ -512,6 +521,58 @@ func (q *Queue) applyCookieFile(ctx playwright.BrowserContext) {
 		return
 	}
 	log.Printf("[COOKIES] Injected %d cookies from %s", len(cookies), path)
+}
+
+// RunKeyed enqueues a Playwright operation identified by key. Requests
+// with the same key are deduplicated: if an identical request is queued
+// or already executing, the new caller does NOT enqueue a second copy —
+// it waits for the first one and receives the same result. This prevents
+// double-fetch storms when several code paths (UI actions, schedulers,
+// auto-download) request the same page concurrently. An empty key
+// disables dedupe for that request.
+func (q *Queue) RunKeyed(key string, fn func(ctx playwright.BrowserContext) error) error {
+	if key == "" {
+		return q.Run(fn)
+	}
+
+	q.keyedMu.Lock()
+	if waiting, ok := q.keyedWaiting[key]; ok {
+		// Identical request already queued or running: piggyback on it.
+		waitCh := make(chan error, 1)
+		q.keyedWaiting[key] = append(waiting, waitCh)
+		q.keyedMu.Unlock()
+		log.Printf("[BROWSER-QUEUE] Duplicate request for key %q deduplicated; sharing in-flight result", key)
+		return <-waitCh
+	}
+	// First request for this key: register it.
+	q.keyedWaiting[key] = nil
+	q.keyedMu.Unlock()
+
+	err := q.Run(fn)
+
+	// Release all piggybacked waiters with the same result.
+	q.keyedMu.Lock()
+	waiters := q.keyedWaiting[key]
+	delete(q.keyedWaiting, key)
+	q.keyedMu.Unlock()
+	for _, ch := range waiters {
+		ch <- err
+	}
+	return err
+}
+
+// RunWithPageKeyed is RunWithPage with request dedupe by key.
+func (q *Queue) RunWithPageKeyed(key string, fn func(page playwright.Page) error) error {
+	wrapped := func(ctx playwright.BrowserContext) error {
+		q.ctxMu.Lock()
+		page, perr := q.ensurePage()
+		q.ctxMu.Unlock()
+		if perr != nil {
+			return fmt.Errorf("persistent page unavailable: %w", perr)
+		}
+		return fn(page)
+	}
+	return q.RunKeyed(key, wrapped)
 }
 
 // Run enqueues a Playwright operation.  It blocks until the operation

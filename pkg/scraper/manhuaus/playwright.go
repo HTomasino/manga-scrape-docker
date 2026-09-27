@@ -28,7 +28,7 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 	var cookies []*http.Cookie
 	var userAgentStr string
 
-	err := q.RunWithPage(func(page playwright.Page) error {
+	err := q.RunWithPageKeyed(pageURL, func(page playwright.Page) error {
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Executing browser request for: %s", pageURL)
 
 		page.SetDefaultTimeout(60000)
