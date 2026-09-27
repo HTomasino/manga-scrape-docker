@@ -401,12 +401,17 @@ func (q *Queue) ensureContext() (playwright.BrowserContext, error) {
 
 	// Context is not usable — re-create it.
 	if q.ctx != nil {
-		func() {
-			defer func() {
-				recover() // silently ignore panics from closing a dead context
+		// CDP mode: never Close() the context — it belongs to the user's
+		// external browser (their real window/tabs). The connection is
+		// already dead when we get here; just drop the references.
+		if q.cdpEndpoint == "" {
+			func() {
+				defer func() {
+					recover() // silently ignore panics from closing a dead context
+				}()
+				q.ctx.Close()
 			}()
-			q.ctx.Close()
-		}()
+		}
 		q.ctx = nil
 		q.ctxOk = false
 		q.page = nil
@@ -548,20 +553,20 @@ func (q *Queue) Stop() {
 		q.inflight.Wait()
 
 		// Close the persistent browser context (or detach from the external
-		// browser in CDP mode -- the remote Chrome keeps running).
+		// browser in CDP mode). In CDP mode we deliberately do NOT call
+		// cdpBrowser.Close(): playwright's ConnectOverCDP sends Browser.close
+		// over the wire when the browser handle is closed, which TERMINATES
+		// the user's remote browser. The requirement is the opposite — a
+		// browser that was already open stays open — so we only drop our
+		// references. The underlying pipe connection is torn down when the
+		// playwright driver stops (q.pw.Stop()) or the process exits; the
+		// remote Chrome treats a client disconnect as a normal CDP session
+		// end and keeps running.
 		q.ctxMu.Lock()
 		if q.cdpEndpoint != "" {
 			q.page = nil
-			if q.cdpBrowser != nil {
-				func() {
-					defer func() {
-						recover() // silently ignore panics from a dead connection
-					}()
-					q.cdpBrowser.Close()
-				}()
-				q.cdpBrowser = nil
-				log.Printf("[BROWSER-QUEUE] CDP connection closed (external browser left running)")
-			}
+			q.cdpBrowser = nil
+			log.Printf("[BROWSER-QUEUE] Detaching from external browser (browser left running)")
 			q.ctx = nil
 			q.ctxOk = false
 			q.ctxMu.Unlock()
