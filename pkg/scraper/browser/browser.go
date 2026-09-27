@@ -444,11 +444,11 @@ func (q *Queue) ensureContext() (playwright.BrowserContext, error) {
 // missing (first RunWithPage after context creation, or after the tab was
 // closed externally). Caller must hold ctxMu.
 //
-// In CDP mode the tab is adopted instead of created: the queue attaches to
-// the FIRST existing page of the external browser's default context, so
-// operations navigate the user's already-open tab in place rather than
-// spawning new windows in their browser. If the external browser has no
-// pages at all, a new one is opened there and tracked the same way.
+// In CDP mode the queue opens (and keeps) a dedicated tab in the external
+// browser's default context and navigates THAT tab in place for every
+// operation, rather than spawning a new window per request. The user's other
+// tabs are never touched. If the tab is closed externally, a new one is
+// opened and tracked the same way.
 func (q *Queue) ensurePage() (playwright.Page, error) {
 	// A tracked page may have been closed since the last use (user closed
 	// the tab, or the context was re-created): revalidate cheaply.
@@ -462,32 +462,14 @@ func (q *Queue) ensurePage() (playwright.Page, error) {
 	}
 
 	if q.cdpEndpoint != "" {
-		// Prefer adopting an existing tab so remote browsing navigates the
-		// user's current window in place instead of spawning new windows in
-		// their browser. A blank tab (the one parked after the previous
-		// session) is adopted first — it is the scraper's own parked tab,
-		// not a page the user is actively viewing.
-		pages := q.ctx.Pages()
-		var fallback playwright.Page
-		for _, p := range pages {
-			if p.IsClosed() {
-				continue
-			}
-			if p.URL() == "about:blank" {
-				q.page = p
-				log.Printf("[BROWSER-QUEUE] Adopting parked blank tab in external browser")
-				return q.page, nil
-			}
-			if fallback == nil {
-				fallback = p
-			}
-		}
-		if fallback != nil {
-			q.page = fallback
-			log.Printf("[BROWSER-QUEUE] Adopting existing tab (url: %s) in external browser", fallback.URL())
-			return q.page, nil
-		}
-		// No adoptable tab: open one in the remote browser and track it.
+		// Remote browsing must navigate the user's browser IN PLACE. The
+		// tracked page is reused whenever it is alive (it is the tab we
+		// parked after the previous session). We deliberately do NOT scan
+		// the external browser's existing tabs for something to adopt: a
+		// blank tab found there could be the user's own (new-tab page or
+		// homepage), and navigating it away would be hostile. Creating a
+		// fresh tab instead costs one extra window in the rare restart
+		// case and touches nothing of theirs.
 		page, err := q.ctx.NewPage()
 		if err != nil {
 			return nil, fmt.Errorf("failed to open persistent page: %w", err)
