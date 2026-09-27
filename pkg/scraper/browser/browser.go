@@ -443,10 +443,60 @@ func (q *Queue) ensureContext() (playwright.BrowserContext, error) {
 // ensurePage returns the persistent tab, creating it inside the context when
 // missing (first RunWithPage after context creation, or after the tab was
 // closed externally). Caller must hold ctxMu.
+//
+// In CDP mode the tab is adopted instead of created: the queue attaches to
+// the FIRST existing page of the external browser's default context, so
+// operations navigate the user's already-open tab in place rather than
+// spawning new windows in their browser. If the external browser has no
+// pages at all, a new one is opened there and tracked the same way.
 func (q *Queue) ensurePage() (playwright.Page, error) {
+	// A tracked page may have been closed since the last use (user closed
+	// the tab, or the context was re-created): revalidate cheaply.
 	if q.page != nil {
-		return q.page, nil
+		if q.page.IsClosed() {
+			log.Printf("[BROWSER-QUEUE] Persistent page was closed; adopting a new one")
+			q.page = nil
+		} else {
+			return q.page, nil
+		}
 	}
+
+	if q.cdpEndpoint != "" {
+		// Prefer adopting an existing tab so remote browsing navigates the
+		// user's current window in place instead of spawning new windows in
+		// their browser. A blank tab (the one parked after the previous
+		// session) is adopted first — it is the scraper's own parked tab,
+		// not a page the user is actively viewing.
+		pages := q.ctx.Pages()
+		var fallback playwright.Page
+		for _, p := range pages {
+			if p.IsClosed() {
+				continue
+			}
+			if p.URL() == "about:blank" {
+				q.page = p
+				log.Printf("[BROWSER-QUEUE] Adopting parked blank tab in external browser")
+				return q.page, nil
+			}
+			if fallback == nil {
+				fallback = p
+			}
+		}
+		if fallback != nil {
+			q.page = fallback
+			log.Printf("[BROWSER-QUEUE] Adopting existing tab (url: %s) in external browser", fallback.URL())
+			return q.page, nil
+		}
+		// No adoptable tab: open one in the remote browser and track it.
+		page, err := q.ctx.NewPage()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open persistent page: %w", err)
+		}
+		q.page = page
+		log.Printf("[BROWSER-QUEUE] Persistent page opened in external browser")
+		return page, nil
+	}
+
 	page, err := q.ctx.NewPage()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open persistent page: %w", err)
@@ -461,6 +511,11 @@ func (q *Queue) ensurePage() (playwright.Page, error) {
 // receives the persistent page and should navigate in place (page.Goto);
 // it must NOT close the page or the context. Operations still run one at a
 // time, so the shared page is never used concurrently.
+//
+// When the operation finishes, the tab is parked on about:blank: a
+// scraper-left page keeps loading ads/scripts in the background (ad churn),
+// and the parked blank tab is what the next session's adoption logic looks
+// for first.
 func (q *Queue) RunWithPage(fn func(page playwright.Page) error) error {
 	wrapped := func(ctx playwright.BrowserContext) error {
 		q.ctxMu.Lock()
@@ -469,9 +524,36 @@ func (q *Queue) RunWithPage(fn func(page playwright.Page) error) error {
 		if perr != nil {
 			return fmt.Errorf("persistent page unavailable: %w", perr)
 		}
-		return fn(page)
+		err := fn(page)
+		parkPageOnBlank(page)
+		return err
 	}
 	return q.Run(wrapped)
+}
+
+// parkPageOnBlank navigates the persistent tab to about:blank after an
+// operation finishes so it stops loading ads/scripts from whatever page the
+// scraper left behind, and so the next adoption pass can find and reuse a
+// harmless blank tab. Failures are non-fatal (best-effort parking).
+func parkPageOnBlank(page playwright.Page) {
+	if page == nil || page.IsClosed() {
+		return
+	}
+	if url := page.URL(); url == "about:blank" {
+		return // already parked
+	}
+	func() {
+		defer func() {
+			recover() // a dead/closed page must not break the caller's result
+		}()
+		if _, err := page.Goto("about:blank", playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateLoad,
+		}); err != nil {
+			log.Printf("[BROWSER-QUEUE] Failed to park tab on about:blank: %v", err)
+			return
+		}
+		log.Printf("[BROWSER-QUEUE] Parked persistent tab on about:blank")
+	}()
 }
 
 // SetCookieFile registers an imported-cookie file to inject into every
@@ -570,7 +652,9 @@ func (q *Queue) RunWithPageKeyed(key string, fn func(page playwright.Page) error
 		if perr != nil {
 			return fmt.Errorf("persistent page unavailable: %w", perr)
 		}
-		return fn(page)
+		err := fn(page)
+		parkPageOnBlank(page)
+		return err
 	}
 	return q.RunKeyed(key, wrapped)
 }

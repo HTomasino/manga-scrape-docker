@@ -339,6 +339,9 @@ func (s *Server) loadOrCreateHMangaRegistry() error {
 	// in the subsequent scanHMangaArtists.
 	s.hmangaRegistry = registry
 	s.hmangaArtists = make(map[string]*hmanga.Artist)
+	folderFolded := make(map[string]int) // lowercase folderName -> survivor index in keptArtists
+	keptArtists := make([]hmanga.Artist, 0, len(registry.Artists))
+	var droppedDuplicates []string
 
 	needsSave := false // true only when the file is missing, corrupt, or migrated
 	if data, err := os.ReadFile(path); err == nil {
@@ -355,7 +358,7 @@ func (s *Server) loadOrCreateHMangaRegistry() error {
 			}
 		}
 	} else {
-		// File missing ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â will be created on first save.
+		// File missing - it will be created on first save.
 		needsSave = true
 	}
 
@@ -376,7 +379,42 @@ func (s *Server) loadOrCreateHMangaRegistry() error {
 			a.URL = ""
 			needsSave = true
 		}
-		s.hmangaArtists[a.ID] = a
+		// Startup dedupe for the case-insensitive duplicate-add hole: entries
+		// whose folder names match ignoring case ("artist:Foo" vs
+		// "artist:foo") are duplicates of the same artist. The FIRST entry
+		// (earliest in the slice = oldest add) survives; later ones are
+		// merged into it and dropped. Merging happens on a set of survivor
+		// indices; the slice is compacted once after the loop, so no pointer
+		// into the slice is taken before compaction.
+		folded := strings.ToLower(a.FolderName)
+		if survivorIdx, exists := folderFolded[folded]; exists {
+			survivor := &registry.Artists[survivorIdx]
+			survivor.BookCount += a.BookCount
+			survivor.BooksDownloaded += a.BooksDownloaded
+			if survivor.LastCheckedAt.Before(a.LastCheckedAt) {
+				survivor.LastCheckedAt = a.LastCheckedAt
+			}
+			if survivor.URL == "" && a.URL != "" {
+				survivor.URL = a.URL
+			}
+			survivor.UpdatedAt = time.Now()
+			log.Printf("[HMANGA] Registry dedupe: merging duplicate artist folder %q (%s) into %s and dropping %s", a.FolderName, a.ID, survivor.ID, a.ID)
+			droppedDuplicates = append(droppedDuplicates, a.ID)
+			needsSave = true
+			continue
+		}
+		folderFolded[folded] = len(keptArtists)
+		keptArtists = append(keptArtists, *a)
+	}
+
+	// Compact the registry to the survivors, then rebuild the artist map
+	// from the final slice — no pointers into the original slice were kept,
+	// so the shift cannot corrupt anything.
+	if len(droppedDuplicates) > 0 {
+		registry.Artists = keptArtists
+	}
+	for i := range registry.Artists {
+		s.hmangaArtists[registry.Artists[i].ID] = &registry.Artists[i]
 	}
 	if needsSave {
 		return s.saveHMangaRegistry()
@@ -1125,14 +1163,21 @@ func (s *Server) handleAddHMArtist(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 
-	// Reject duplicates: if the artist is already tracked (by ID or by URL),
-	// don't create a second registry entry. The existing folder is reused by
-	// design, but the registry must keep a single entry per artist. The check
-	// and append are done under a single write lock to avoid a TOCTOU race
-	// where two concurrent adds both pass the check and both append.
+	// Reject duplicates: if the artist is already tracked (by ID, by exact
+	// URL, or by case-insensitive folder name), don't create a second
+	// registry entry. The existing folder is reused by design, but the
+	// registry must keep a single entry per artist. The check and append
+	// are done under a single write lock to avoid a TOCTOU race where two
+	// concurrent adds both pass the check and both append.
+	//
+	// Case-insensitive folder matching closes the "artist:Foo" /
+	// "artist:foo" hole: those produce different folder names, different
+	// generated IDs, and different URLs — but they are the same artist, and
+	// accepting both created duplicate registry entries that each ran their
+	// own refresh cycle over the same .books.json forever.
 	s.mu.Lock()
 	for _, a := range s.hmangaArtists {
-		if a.ID == artistID || (req.URL != "" && a.URL == req.URL) {
+		if a.ID == artistID || (req.URL != "" && a.URL == req.URL) || strings.EqualFold(a.FolderName, folderName) {
 			s.mu.Unlock()
 			http.Error(w, "Artist already added", http.StatusConflict)
 			return
@@ -2895,6 +2940,16 @@ func (s *Server) checkHMangaArtistsForUpdates() {
 		}
 		log.Printf("[HMANGA] Auto-checking artist '%s' (interval: %s)", a.FolderName, a.CheckInterval)
 		artistID := a.ID
+		// Stamp LastCheckedAt at ENQUEUE time, not only after the scrape
+		// finishes: a scrape can easily outlast the one-minute scheduler
+		// tick (Cloudflare waits alone run 120s). Without the pre-stamp,
+		// every tick while the scrape runs re-enqueues the same artist,
+		// cycling identical refresh ops over and over.
+		now := time.Now()
+		s.updateHMangaRegistryEntry(artistID, func(a *hmanga.Artist) {
+			a.LastCheckedAt = now
+			a.UpdatedAt = now
+		})
 		s.enqueueHMangaOp(&hmangaOpItem{
 			kind:     hmangaOpRefresh,
 			artistID: artistID,

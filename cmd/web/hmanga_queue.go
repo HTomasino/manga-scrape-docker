@@ -248,6 +248,26 @@ func (s *Server) enqueueHMangaOp(op *hmangaOpItem) string {
 	}
 	op.startedCh = make(chan struct{})
 
+	// Refresh dedupe: an artist must never have two live (pending or
+	// running) refresh ops. Multiple sources enqueue refreshes (per-minute
+	// scheduler, check-all, manual refresh, artist add); without this an
+	// artist whose scrape takes longer than the scheduler tick gets a new
+	// op every tick, cycling the same scrape over and over. The caller
+	// receives the existing op's id so it can still track it; any extra
+	// WaitGroup is released since no new work was queued.
+	if op.kind == hmangaOpRefresh && op.artistID != "" {
+		for _, existing := range s.hmangaOpQueue {
+			if existing.id != op.id &&
+				existing.artistID == op.artistID &&
+				existing.status != hmangaOpDone &&
+				existing.status != hmangaOpFailed {
+				op.releaseWg()
+				log.Printf("[HMANGA-QUEUE] Refresh op for artist %s deduplicated (op %s already %d)", op.artistID, existing.id, existing.status)
+				return existing.id
+			}
+		}
+	}
+
 	s.hmangaOpQueueMu.Lock()
 	if s.hmangaOpQueueCond == nil {
 		s.hmangaOpQueueCond = sync.NewCond(&s.hmangaOpQueueMu)
