@@ -173,6 +173,15 @@ type Queue struct {
 	// sites whose Cloudflare challenge cannot pass in the container.
 	cookieFilePath string
 
+	// cdpEndpoint, when set (BROWSER_CDP_ENDPOINT), connects the queue to an
+	// external browser (e.g. a real desktop Chrome started with
+	// --remote-debugging-port) instead of launching one in the container.
+	// The remote browser's real fingerprint passes Cloudflare challenges
+	// that a containerized browser cannot; idle-close and cookie-file
+	// injection are disabled in this mode.
+	cdpEndpoint string
+	cdpBrowser  playwright.Browser
+
 	// lastContextFail tracks when the last context creation attempt failed,
 	// used to enforce a cooldown between retries.
 	lastContextFail time.Time
@@ -281,6 +290,10 @@ func (q *Queue) processLoop() {
 // closeContext closes the persistent browser context (but not the Playwright
 // driver).  It is called from processLoop when the idle timer fires.
 func (q *Queue) closeContext() {
+	// CDP mode: the external browser is not ours to close.
+	if q.cdpEndpoint != "" {
+		return
+	}
 	q.ctxMu.Lock()
 	defer q.ctxMu.Unlock()
 	if q.ctx != nil {
@@ -302,6 +315,55 @@ func (q *Queue) closeContext() {
 // directly.  If a previous creation attempt failed recently, a cooldown
 // period is enforced to avoid rapid retry loops.
 func (q *Queue) ensureContext() (playwright.BrowserContext, error) {
+	// CDP mode: connect to an externally managed browser instead of
+	// launching one. The remote browser keeps running between requests
+	// (idle-close does not apply), so connect at most once.
+	if q.cdpEndpoint != "" {
+		q.ctxMu.Lock()
+		defer q.ctxMu.Unlock()
+		if q.ctxOk && q.ctx != nil {
+			return q.ctx, nil
+		}
+		q.pwMu.Lock()
+		if q.pw == nil {
+			pw, err := playwright.Run()
+			if err != nil {
+				q.pwMu.Unlock()
+				return nil, &pwInitErr{original: err}
+			}
+			q.pw = pw
+			log.Printf("[BROWSER-QUEUE] Playwright driver started")
+		}
+		browserType := q.pw.Chromium
+		b, cerr := browserType.ConnectOverCDP(q.cdpEndpoint)
+		q.pwMu.Unlock()
+		if cerr != nil {
+			q.lastContextFail = time.Now()
+			return nil, fmt.Errorf("CDP connect to %s failed: %w", q.cdpEndpoint, cerr)
+		}
+		q.cdpBrowser = b
+		// Use the remote browser's default context (its real profile);
+		// ConnectOverCDP creates one implicitly on first connect.
+		ctxs := b.Contexts()
+		var ctx playwright.BrowserContext
+		if len(ctxs) > 0 {
+			ctx = ctxs[0]
+		} else {
+			// A remote Chrome without any context: create one over the CDP
+			// connection (still owned by the remote browser).
+			nc, nerr := b.NewContext()
+			if nerr != nil {
+				q.lastContextFail = time.Now()
+				return nil, fmt.Errorf("CDP browser has no contexts and NewContext failed: %w", nerr)
+			}
+			ctx = nc
+		}
+		q.ctx = ctx
+		q.ctxOk = true
+		q.lastContextFail = time.Time{}
+		log.Printf("[BROWSER-QUEUE] Connected to external browser via CDP (%s)", q.cdpEndpoint)
+		return ctx, nil
+	}
 	// Verify the display server is up before creating a context: a crashed
 	// Xvfb (container) previously left the browser unusable until restart.
 	// Cheap unix-socket connect on Linux; no-op elsewhere.
@@ -408,6 +470,20 @@ func (q *Queue) SetCookieFile(path string) {
 	q.cookieFilePath = path
 }
 
+// SetCDPEndpoint routes all queue operations through an externally
+// managed browser reachable at the given CDP endpoint (a Chrome/Chromium
+// started with --remote-debugging-port=<port>). Use this for sites whose
+// interactive Cloudflare Turnstile rejects containerized browsers: the
+// external browser's real fingerprint passes where the container cannot.
+// Pass an empty string to disable. Idle-close and cookie-file injection
+// are disabled in this mode; the external browser's own session (cookies,
+// login state) is used directly.
+func (q *Queue) SetCDPEndpoint(endpoint string) {
+	q.ctxMu.Lock()
+	defer q.ctxMu.Unlock()
+	q.cdpEndpoint = endpoint
+}
+
 // applyCookieFile injects the imported cookies (when configured) into the
 // given context. Called from ensureContext on every fresh context so a
 // user-supplied cf_clearance etc. survives context recreation. Failures
@@ -471,27 +547,48 @@ func (q *Queue) Stop() {
 		// still running, which would cause panics.
 		q.inflight.Wait()
 
-		// Close the persistent browser context.
+		// Close the persistent browser context (or detach from the external
+		// browser in CDP mode -- the remote Chrome keeps running).
 		q.ctxMu.Lock()
-		if q.ctx != nil {
+		if q.cdpEndpoint != "" {
 			q.page = nil
-			func() {
-				defer func() {
-					recover() // silently ignore panics from closing a dead context
+			if q.cdpBrowser != nil {
+				func() {
+					defer func() {
+						recover() // silently ignore panics from a dead connection
+					}()
+					q.cdpBrowser.Close()
 				}()
-				q.ctx.Close()
-			}()
+				q.cdpBrowser = nil
+				log.Printf("[BROWSER-QUEUE] CDP connection closed (external browser left running)")
+			}
 			q.ctx = nil
 			q.ctxOk = false
-			log.Printf("[BROWSER-QUEUE] Browser context closed")
+			q.ctxMu.Unlock()
+		} else {
+			if q.ctx != nil {
+				q.page = nil
+				func() {
+					defer func() {
+						recover() // silently ignore panics from closing a dead context
+					}()
+					q.ctx.Close()
+				}()
+				q.ctx = nil
+				q.ctxOk = false
+				log.Printf("[BROWSER-QUEUE] Browser context closed")
+			}
+			q.ctxMu.Unlock()
 		}
-		q.ctxMu.Unlock()
 
 		// Remove the recorded Chrome PID so a future launch does not see a
 		// stale PID and attempt to kill a process that no longer exists.
 		// Chrome itself has been closed above; only our bookkeeping file
-		// remains to be cleared.
-		ClearChromePID(defaultUserDataDir())
+		// remains to be cleared. In CDP mode the remote browser is not
+		// ours, so its PID bookkeeping does not apply.
+		if q.cdpEndpoint == "" {
+			ClearChromePID(defaultUserDataDir())
+		}
 
 		// Stop the Playwright driver.
 		q.pwMu.Lock()
@@ -615,6 +712,11 @@ func LaunchPersistentContextAt(pw *playwright.Playwright, cfg Config, userDataDi
 		"--disable-blink-features=AutomationControlled",
 		"--disable-features=AutomationControlled",
 		"--disable-infobars",
+		// Suppress the "Chrome is being controlled by automated test
+		// software" info bar that Playwright's --enable-automation switch
+		// triggers; some Cloudflare scoring inputs key off the automation
+		// banner being visible.
+		"--test-type",
 		"--no-first-run",
 		"--no-default-browser-check",
 	}

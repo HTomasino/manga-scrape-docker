@@ -431,6 +431,62 @@ Notes:
   expire the site falls back to the normal challenge flow; re-export fresh
   cookies from your browser.
 - Cookie import does not affect the Chrome profile volume — it is additive.
+- **Interactive Turnstile caveat**: if the site shows a "Verify you are
+  human" checkbox that loops even with valid imported cookies, the site is
+  scoring the browser session as automated (see
+  [BROWSER_CDP_ENDPOINT](#attaching-to-an-external-browser-over-cdp)).
+
+---
+
+## Attaching to an External Browser (CDP)
+
+The strongest workaround for hostile Cloudflare sites: point the scraper at
+a **real desktop browser** on the host. The external browser's genuine
+fingerprint (real display, no automation flags, established profile) passes
+challenges that a containerized browser cannot — including interactive
+Turnstile widgets that ignore imported cookies.
+
+### 1. Start your desktop Chrome with a debugging port
+
+Close all Chrome windows first (Chrome only enables the debugging port if no
+existing instance is running with the same profile):
+
+```
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```
+
+### 2. Point the scraper at it
+
+```yaml
+services:
+  scraper:
+    environment:
+      - BROWSER_CDP_ENDPOINT=http://host.docker.internal:9222
+```
+
+(The queue uses `ConnectOverCDP`; Docker Desktop's `host.docker.internal`
+alias reaches the host.)
+
+### 3. Restart
+
+All Playwright operations (every scraper, the H-Manga login/extract/download
+flow) now run inside your desktop Chrome: the challenge you already solved
+persists, and no container browser is launched. On shutdown the scraper only
+**detaches** from the browser — the browser keeps running.
+
+Notes:
+
+- The external browser is not managed by the scraper: it must be started
+  manually (or as a host service) before the scraper needs it. Scrapes fail
+  fast with a clear `CDP connect to ... failed` error while it is down.
+- Chrome binds the debugging port to loopback only; if the browser runs on a
+  different host, expose it with a forwarding tool (e.g.
+  `socat TCP-LISTEN:9222,fork TCP:127.0.0.1:9222` on that host) and point
+  `BROWSER_CDP_ENDPOINT` at it.
+- Cookie import is ignored in CDP mode (the external browser's own session
+  is authoritative).
+- Do not minimize the external browser window: Chrome throttles background
+  windows and timed challenge checks can stall.
 
 ---
 
@@ -447,5 +503,6 @@ Notes:
 | CIFS rename/permission errors in logs | Some servers reject rename-based atomic writes with specific option sets; add `noserverino`, ensure `file_mode`/`dir_mode` allow write, or switch to the host-mount approach. |
 | Slow startup with H-Manga on a share | Set `verifyHMDownloads: false` in `config.json` to skip the disk verification scan. |
 | Downloads killed at 10 minutes during updates | `SCRAPE_SHUTDOWN_TIMEOUT_SECONDS` exceeds `stop_grace_period`; raise both (compose default grace is 15m). |
-| ThunderScans scrape fails with "Cloudflare challenge did not resolve ... device-attestation" | en-thunderscans.com enforces Cloudflare Private Access Token (device attestation) challenges that a Linux container cannot pass — the challenge page 401s on the `/pat/` endpoint and the title stays "Just a moment..." forever. Sites using plain JS challenges (AsuraScans, DrakeComic, ManhuaUS) pass fine. Scrape ThunderScans series from a native Windows install, or wait for Cloudflare/site rules to change. |
+| ThunderScans scrape fails with "Cloudflare challenge did not resolve ... device-attestation" | en-thunderscans.com enforces Cloudflare Private Access Token (device attestation) challenges that a Linux container cannot pass — the challenge page 401s on the `/pat/` endpoint and the title stays "Just a moment..." forever. Scrape ThunderScans series from a native Windows install, or [attach the scraper to your desktop browser over CDP](#attaching-to-an-external-browser-over-cdp). |
+| ManhuaUS scrape fails with interactive "Verify you are human" that loops even with imported cookies | The site serves an interactive Turnstile that scores the container browser as automated (automation info bar visible, synthetic clicks loop). Use [CDP mode](#attaching-to-an-external-browser-over-cdp) with your desktop Chrome, or re-export fresh cookies after each manual solve. The timeout log now includes the page title and URL (`[MANHUAUS-PLAYWRIGHT] Challenge unresolved at timeout: ...`) to distinguish challenge types. |
 | "System Chrome not installed; using Playwright Chromium" in every container log line | Informational, logged once per process. The image now installs real Google Chrome (used when present); this line appears only if Chrome was removed at runtime. |

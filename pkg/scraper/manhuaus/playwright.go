@@ -59,7 +59,9 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 
 		title, _ := page.Title()
 		if isCloudflareChallenge(title) {
-			return fmt.Errorf("Cloudflare challenge did not resolve within %v", cloudflareWaitTimeout)
+			currentURL := page.URL()
+			log.Printf("[MANHUAUS-PLAYWRIGHT] Challenge unresolved at timeout: title=%q url=%s", title, currentURL)
+			return fmt.Errorf("Cloudflare challenge did not resolve within %v (title: %q)", cloudflareWaitTimeout, title)
 		}
 
 		time.Sleep(postResolutionWait)

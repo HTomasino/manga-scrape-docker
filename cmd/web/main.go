@@ -274,6 +274,16 @@ func NewServer() (*Server, error) {
 	// Create shared browser queue for serialising Playwright requests
 	browserQueue := browser.NewQueue(browser.Config{Background: cfg.BrowserBackground})
 
+	// Optional external browser over CDP (BROWSER_CDP_ENDPOINT, e.g.
+	// host.docker.internal:9222). Hostile Cloudflare sites (interactive
+	// Turnstile) pass only with a real desktop browser fingerprint; the
+	// endpoint must be a Chrome started with --remote-debugging-port. When
+	// set, the queue attaches to that browser and skips launching its own.
+	if endpoint := os.Getenv("BROWSER_CDP_ENDPOINT"); endpoint != "" {
+		browserQueue.SetCDPEndpoint(endpoint)
+		log.Printf("[BROWSER-QUEUE] CDP mode enabled: attaching to external browser at %s", endpoint)
+	}
+
 	// Optional imported cookies (JSON array or Netscape cookies.txt) for
 	// sites whose Cloudflare challenge cannot pass in the container. The
 	// file is looked up in DATA_DIR/config (cookieFile) or the COOKIE_FILE

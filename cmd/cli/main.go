@@ -86,6 +86,10 @@ func main() {
 	// Create scraper registry and register scrapers
 	browserCfg := browser.Config{Background: cfg.BrowserBackground}
 	browserQueue := browser.NewQueue(browserCfg)
+	if endpoint := os.Getenv("BROWSER_CDP_ENDPOINT"); endpoint != "" {
+		browserQueue.SetCDPEndpoint(endpoint)
+		log.Printf("[BROWSER-QUEUE] CDP mode enabled: attaching to external browser at %s", endpoint)
+	}
 	if path := cookieImportPath(); path != "" {
 		browserQueue.SetCookieFile(path)
 		log.Printf("[COOKIES] Cookie import enabled: %s", path)
