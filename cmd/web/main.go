@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"hash/fnv"
@@ -4546,8 +4547,22 @@ func main() {
 		server.ShutdownAndExit()
 	}()
 
+	// The signal handler runs ShutdownAndExit in a goroutine, which closes
+	// the HTTP listener and makes Start return "http: Server closed" while
+	// the shutdown is STILL IN PROGRESS (queue drain, H-Manga wait). Racing
+	// a log.Fatalf here would kill the process mid-shutdown, before
+	// browserQueue.Stop() could run its detach logic — killing the
+	// Playwright driver mid-operation and leaving zombie chrome processes.
+	// Treat "http: Server closed" (the expected result of our own shutdown)
+	// as a clean stop and WAIT for the shutdown goroutine to finish instead.
 	if err := server.Start(host + ":" + port); err != nil {
-		log.Fatalf("Server failed: %v", err)
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Server failed: %v", err)
+		}
+		// Our own shutdown closed the listener: block until ShutdownAndExit
+		// finishes (including browserQueue.Stop()) so nothing is torn down
+		// mid-way, then let the shutdown goroutine's os.Exit end the process.
+		select {}
 	}
 }
 

@@ -740,14 +740,23 @@ func (q *Queue) Stop() {
 			ClearChromePID(defaultUserDataDir())
 		}
 
-		// Stop the Playwright driver.
-		q.pwMu.Lock()
-		if q.pw != nil {
-			q.pw.Stop()
-			q.pw = nil
-			log.Printf("[BROWSER-QUEUE] Playwright driver stopped")
+		// Stop the Playwright driver. In CDP mode we deliberately LEAVE the
+		// driver running: its exit path is the last remaining code that
+		// could send Browser.close to the remote browser, and the whole
+		// point of CDP mode is that an already-open external browser stays
+		// open. The driver is a small node process; the next scraper start
+		// reuses the running one and re-attaches over CDP.
+		if q.cdpEndpoint == "" {
+			q.pwMu.Lock()
+			if q.pw != nil {
+				q.pw.Stop()
+				q.pw = nil
+				log.Printf("[BROWSER-QUEUE] Playwright driver stopped")
+			}
+			q.pwMu.Unlock()
+		} else {
+			log.Printf("[BROWSER-QUEUE] Playwright driver left running (CDP mode: external browser must stay open)")
 		}
-		q.pwMu.Unlock()
 	})
 }
 
