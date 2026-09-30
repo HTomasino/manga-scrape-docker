@@ -40,3 +40,5 @@ Thumbs.db
 !.kilo/README.md
 !.gitignore
 .kilo/ui/nul
+opencode.json
+.kilo/agent-manager.json

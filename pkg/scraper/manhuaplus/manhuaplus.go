@@ -17,7 +17,8 @@ import (
 )
 
 var (
-	chapterPattern = regexp.MustCompile(`/chapter-\d+`)
+	// Match both root-level slug-chapter-{n}/ and traditional /chapter-{n} patterns
+	chapterPattern = regexp.MustCompile(`/(?:[^/]*-)?chapter-\d+`)
 	chapterIDRegex = regexp.MustCompile(`CHAPTER_ID\s*=\s*(\d+)`)
 )
 
@@ -125,6 +126,12 @@ func (s *Scraper) ExtractChapters(html string, baseURL string) ([]models.Chapter
 		number := scraper.ParseChapterNumber(fullURL)
 		if number == 0 {
 			number = scraper.ParseChapterNumber(title)
+		}
+
+		// If we still don't have a valid chapter number, skip this chapter
+		if number == 0 {
+			log.Printf("[MANHUAPLUS-EXTRACT] Skipping unnumbered chapter: %s", fullURL)
+			return
 		}
 
 		chapters = append(chapters, models.Chapter{

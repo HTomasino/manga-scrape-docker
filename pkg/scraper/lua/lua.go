@@ -187,6 +187,12 @@ func (s *Scraper) extractChaptersFromHTML(html string, baseURL string) ([]models
 			number = scraper.ParseChapterNumber(title)
 		}
 
+		// If we still don't have a valid chapter number, skip this chapter
+		if number == 0 {
+			log.Printf("[LUA-API] Skipping unnumbered chapter: %s", fullURL)
+			return
+		}
+
 		chapters = append(chapters, models.Chapter{
 			ID:     scraper.GenerateID(),
 			URL:    fullURL,

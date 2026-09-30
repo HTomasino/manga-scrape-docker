@@ -99,7 +99,6 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 				attempt, dnsRetryAttempts, navErr, delay)
 			time.Sleep(delay)
 		}
-		defer page.Close()
 
 		log.Printf("[THUNDERSCANS-PLAYWRIGHT] Waiting for Cloudflare challenge to resolve...")
 		deadline := time.Now().Add(cloudflareWaitTimeout)

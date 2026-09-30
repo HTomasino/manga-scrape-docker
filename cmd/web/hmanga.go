@@ -413,8 +413,11 @@ func (s *Server) loadOrCreateHMangaRegistry() error {
 	if len(droppedDuplicates) > 0 {
 		registry.Artists = keptArtists
 	}
+	// Store copies instead of pointers to avoid data race on models.Download
+	s.hmangaArtists = make(map[string]*hmanga.Artist)
 	for i := range registry.Artists {
-		s.hmangaArtists[registry.Artists[i].ID] = &registry.Artists[i]
+		artistCopy := registry.Artists[i]
+		s.hmangaArtists[artistCopy.ID] = &artistCopy
 	}
 	if needsSave {
 		return s.saveHMangaRegistry()
@@ -438,7 +441,7 @@ func (s *Server) saveHMangaRegistry() error {
 	if s.hmangaRegistrySnapshots != nil && bytes.Equal(s.hmangaRegistrySnapshots, data) {
 		return nil
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(path, data, 0644); err != nil {
 		return err
 	}
 	s.hmangaRegistrySnapshots = append([]byte(nil), data...)
@@ -506,7 +509,7 @@ func (s *Server) saveHMangaGlobalCache(cache *hmanga.GlobalBookCache) error {
 	if s.hmangaGlobalSnapshots != nil && bytes.Equal(s.hmangaGlobalSnapshots, data) {
 		return nil
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(path, data, 0644); err != nil {
 		return err
 	}
 	s.hmangaGlobalSnapshots = append([]byte(nil), data...)
@@ -728,7 +731,7 @@ func (s *Server) saveHMangaBookState(folderName string, st *hmanga.BookStateFile
 	if prev, ok := s.hmangaStateSnapshots[folderName]; ok && bytes.Equal(prev, data) {
 		return nil
 	}
-	if err := os.WriteFile(s.getHMangaBookStatePath(folderName), data, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(s.getHMangaBookStatePath(folderName), data, 0644); err != nil {
 		return err
 	}
 	s.hmangaStateSnapshots[folderName] = append([]byte(nil), data...)
@@ -906,6 +909,12 @@ func (s *Server) scanHMangaArtists() error {
 			a.BooksDownloaded = downloaded
 			a.FolderName = folderName
 			a.UpdatedAt = time.Now()
+			for i := range s.hmangaRegistry.Artists {
+				if s.hmangaRegistry.Artists[i].ID == artistID {
+					s.hmangaRegistry.Artists[i] = *a
+					break
+				}
+			}
 		} else {
 			s.hmangaRegistry.Artists = append(s.hmangaRegistry.Artists, hmanga.Artist{
 				ID:              artistID,
@@ -916,7 +925,8 @@ func (s *Server) scanHMangaArtists() error {
 				AddedAt:         time.Now(),
 				UpdatedAt:       time.Now(),
 			})
-			s.hmangaArtists[artistID] = &s.hmangaRegistry.Artists[len(s.hmangaRegistry.Artists)-1]
+			s.hmangaArtists[artistID] = &hmanga.Artist{}
+			*s.hmangaArtists[artistID] = s.hmangaRegistry.Artists[len(s.hmangaRegistry.Artists)-1]
 		}
 		s.mu.Unlock()
 	}
@@ -1195,10 +1205,10 @@ func (s *Server) handleAddHMArtist(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:       now,
 		Scraping:        true,
 	})
-	s.hmangaArtists[artistID] = &s.hmangaRegistry.Artists[len(s.hmangaRegistry.Artists)-1]
+	artistCopy := s.hmangaRegistry.Artists[len(s.hmangaRegistry.Artists)-1]
+	s.hmangaArtists[artistID] = &artistCopy
 	s.hmangaBooks[artistID] = []hmanga.Book{}
 	s.saveHMangaRegistry()
-	artistCopy := *s.hmangaArtists[artistID]
 	s.mu.Unlock()
 
 	// Prepare state. If we adopted an existing download index, keep its books
@@ -1339,11 +1349,19 @@ func (s *Server) enqueueHMDownloadForBook(artistID, folderName, bookID, title st
 
 // handleDeleteHMArtist removes an artist from the registry (keeps files).
 func (s *Server) handleDeleteHMArtist(w http.ResponseWriter, r *http.Request, artistID string) {
+	// Delete the artist from registry and rebuild map with copies to avoid pointer aliasing issues
 	s.mu.Lock()
 	found := false
 	for i, a := range s.hmangaRegistry.Artists {
 		if a.ID == artistID {
-			s.hmangaRegistry.Artists = append(s.hmangaRegistry.Artists[:i], s.hmangaRegistry.Artists[i+1:]...)
+			// Create new slice without this element instead of using append (which causes shifting)
+			newArtists := make([]hmanga.Artist, 0, len(s.hmangaRegistry.Artists)-1)
+			for j, otherArtist := range s.hmangaRegistry.Artists {
+				if i != j {
+					newArtists = append(newArtists, otherArtist)
+				}
+			}
+			s.hmangaRegistry.Artists = newArtists
 			found = true
 			break
 		}
@@ -2976,8 +2994,11 @@ func (s *Server) setHMangaScrapingPaused(paused bool) {
 	s.hmangaScrapingPaused.Store(paused)
 	s.mu.Lock()
 	s.config.HMangaScrapingPaused = paused
+	// Snapshot config under lock to avoid races when saving and reading
+	cfgCopy := &config.Config{}
+	*cfgCopy = *s.config
 	s.mu.Unlock()
-	if err := config.Save(s.config); err != nil {
+	if err := config.Save(cfgCopy); err != nil {
 		log.Printf("[SCRAPING] Failed to persist H-Manga scraping state: %v", err)
 	}
 }

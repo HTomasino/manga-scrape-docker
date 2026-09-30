@@ -135,6 +135,12 @@ func (s *Scraper) ExtractChapters(html string, baseURL string) ([]models.Chapter
 			number = scraper.ParseChapterNumber(fullURL)
 		}
 
+		// If we still don't have a valid chapter number, skip this chapter
+		if number == 0 {
+			log.Printf("[DRAKE-EXTRACT] Skipping unnumbered chapter: %s", fullURL)
+			return
+		}
+
 		chapters = append(chapters, models.Chapter{
 			ID:     scraper.GenerateID(),
 			URL:    fullURL,

@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -513,12 +514,20 @@ func (s *Server) scanDownloadFolder() error {
 			CreatedAt:          regEntry.AddedAt,
 			UpdatedAt:          regEntry.UpdatedAt,
 		}
+
+		// Hold s.mu around all map mutations to prevent concurrent map access panic
+		s.mu.Lock()
 		s.series[series.ID] = series
+		s.mu.Unlock()
+
 		discovered++
 	}
 
 	// Save updated registry
-	if err := s.saveRegistry(s.registry); err != nil {
+	s.mu.Lock()
+	err = s.saveRegistry(s.registry)
+	s.mu.Unlock()
+	if err != nil {
 		log.Printf("Warning: Failed to save registry after scan: %v", err)
 	}
 
@@ -1024,8 +1033,11 @@ func (s *Server) setMangaScrapingPaused(paused bool) {
 	s.scrapingPaused.Store(paused)
 	s.mu.Lock()
 	s.config.MangaScrapingPaused = paused
+	// Snapshot config under lock to avoid races when saving and reading
+	cfgCopy := &config.Config{}
+	*cfgCopy = *s.config
 	s.mu.Unlock()
-	if err := config.Save(s.config); err != nil {
+	if err := config.Save(cfgCopy); err != nil {
 		log.Printf("[SCRAPING] Failed to persist manga scraping state: %v", err)
 	}
 }
@@ -1763,13 +1775,6 @@ func (s *Server) handleAddSeries(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Folder '%s' already exists, reusing it for new series", folderName)
 	}
 
-	// Persist series metadata and cover before scheduling downloads.
-	// The series folder must exist so series-info.json and the cover can be
-	// written even if no chapters have been downloaded yet.
-	if err := s.saveSeriesMetadata(folderName, scr, html); err != nil {
-		log.Printf("Warning: Failed to save series metadata: %v", err)
-	}
-
 	// Reject duplicates: if the series is already tracked by URL OR by folder
 	// name, don't add a second registry entry. Reusing an existing folder is
 	// allowed only when no other tracked series owns that folder, otherwise
@@ -1791,7 +1796,6 @@ func (s *Server) handleAddSeries(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.mu.Unlock()
 
 	// Create series ID
 	seriesID := uuid.New().String()
@@ -1814,9 +1818,19 @@ func (s *Server) handleAddSeries(w http.ResponseWriter, r *http.Request) {
 		AddedAt:            now,
 		UpdatedAt:          now,
 	}
-	if err := s.appendRegistryEntry(regEntry); err != nil {
+	s.registry.Series = append(s.registry.Series, regEntry)
+	if err := s.saveRegistry(s.registry); err != nil {
+		s.mu.Unlock()
 		http.Error(w, fmt.Sprintf("Failed to save registry: %v", err), http.StatusInternalServerError)
 		return
+	}
+	s.mu.Unlock()
+
+	// Persist series metadata and cover after the registry entry is added.
+	// The series folder must exist so series-info.json and the cover can be
+	// written even if no chapters have been downloaded yet.
+	if err := s.saveSeriesMetadata(folderName, scr, html); err != nil {
+		log.Printf("Warning: Failed to save series metadata: %v", err)
 	}
 
 	// Create chapter state file in series folder
@@ -2594,6 +2608,12 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 	// Iterate chapters in sorted order (ascending by chapter number) for deterministic processing
 	sortedChapterKeys := make([]string, 0, len(chapterState.Chapters))
 	for chapterKey := range chapterState.Chapters {
+		// Validate chapter key to prevent path traversal attacks
+		// Only allow chapter keys that are valid numbers (e.g., "1", "1.5", "10")
+		if !isValidChapterKey(chapterKey) {
+			log.Printf("[SCAN-MISSING] Skipping invalid chapter key: %q", chapterKey)
+			continue
+		}
 		sortedChapterKeys = append(sortedChapterKeys, chapterKey)
 	}
 	sort.Slice(sortedChapterKeys, func(i, j int) bool {
@@ -2686,6 +2706,7 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 		chapterKey := item.key
 		chapter := item.chapter
 		existingFiles := item.existingFiles
+		// Copy the chapter info to avoid race conditions with concurrent updates
 		chInfo := chapterState.Chapters[chapterKey]
 
 		// Fetch and extract images
@@ -2765,6 +2786,7 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 			chInfo.PerImageStatus = dl.PerImageStatus
 		}
 		chInfo.DownloadedAt = time.Now()
+		// Copy the updated info back to the chapterState map
 		chapterState.Chapters[chapterKey] = chInfo
 	}
 
@@ -2798,6 +2820,22 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 		"missingChapters":      missingCount,
 		"redownloadedChapters": redownloadedCount,
 	})
+}
+
+// isValidChapterKey validates that a chapter key is safe and only contains valid numeric characters
+// to prevent path traversal attacks. Chapter keys must match the pattern ^[0-9]+(\.[0-9]+)?$
+func isValidChapterKey(key string) bool {
+	// Check for empty key
+	if key == "" {
+		return false
+	}
+	// Check for path traversal patterns
+	if strings.Contains(key, "..") || strings.Contains(key, "/") || strings.Contains(key, "\\") {
+		return false
+	}
+	// Check if it matches the expected numeric pattern (integers or decimals)
+	matched, err := regexp.MatchString(`^[0-9]+(\.[0-9]+)?$`, key)
+	return err == nil && matched
 }
 
 // handleForceRedownload deletes and re-downloads chapters in a specified range
@@ -2867,9 +2905,20 @@ func (s *Server) handleForceRedownload(w http.ResponseWriter, r *http.Request) {
 	// Find chapters in the specified range, mark for redownload.
 	toRedownload := make([]string, 0)
 	for chapterKey, chInfo := range chapterState.Chapters {
+		// Validate chapter key to prevent path traversal attacks
+		// Only allow chapter keys that are valid numbers (e.g., "1", "1.5", "10")
+		if !isValidChapterKey(chapterKey) {
+			log.Printf("[FORCE-REDOWNLOAD] Skipping invalid chapter key: %q", chapterKey)
+			continue
+		}
 		num := chInfo.Number
 		if num >= req.FromChapter && num <= req.ToChapter {
 			toRedownload = append(toRedownload, chapterKey)
+			// Delete eagerly under the lock (original semantics): a pre-fetch
+			// here would hold chapterStateMu across N network fetches and read
+			// s.chapters without s.mu. If the later redownload fetch fails,
+			// the chapter is already marked not-downloaded and auto-sync
+			// retries it.
 			chapterDir := filepath.Join(s.config.DownloadPath, folderName, "Chapter "+chapterKey)
 			os.RemoveAll(chapterDir)
 			chInfo.Downloaded = false
@@ -3062,6 +3111,12 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 	}
 
 	chapterKey := strconv.FormatFloat(req.ChapterNumber, 'f', -1, 64)
+	// Validate chapter key to prevent path traversal attacks
+	// Only allow chapter keys that are valid numbers (e.g., "1", "1.5", "10")
+	if !isValidChapterKey(chapterKey) {
+		http.Error(w, fmt.Sprintf("Invalid chapter key: %q", chapterKey), http.StatusBadRequest)
+		return
+	}
 
 	s.mu.RLock()
 	series, ok := s.series[seriesID]
@@ -3097,24 +3152,10 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	chInfo, exists := chapterState.Chapters[chapterKey]
-	if !exists {
+	if _, exists := chapterState.Chapters[chapterKey]; !exists {
 		s.chapterStateMu.Unlock()
 		http.Error(w, fmt.Sprintf("Chapter %s not found in state", chapterKey), http.StatusNotFound)
 		return
-	}
-
-	chapterDir := filepath.Join(s.config.DownloadPath, folderName, "Chapter "+chapterKey)
-	os.RemoveAll(chapterDir)
-
-	chInfo.Downloaded = false
-	chInfo.ImageCount = 0
-	chInfo.DownloadedAt = time.Time{}
-	chInfo.PerImageStatus = nil
-	chapterState.Chapters[chapterKey] = chInfo
-
-	if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
-		log.Printf("[REDOWNLOAD-CHAPTER] Failed to save chapter state before redownload: %v", err)
 	}
 	s.chapterStateMu.Unlock()
 
@@ -3126,12 +3167,15 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 			break
 		}
 	}
-
 	if chapter == nil {
 		http.Error(w, fmt.Sprintf("Chapter %s not found in memory", chapterKey), http.StatusNotFound)
 		return
 	}
 
+	// Fetch chapter page and extract images before deleting anything —
+	// without holding chapterStateMu, so the fetch cannot block concurrent
+	// chapter-state writers. If fetch or extraction fails, the existing
+	// chapter must remain intact.
 	html, err := scraper.FetchHTML(scr, s.httpClient, chapter.URL)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to fetch chapter: %v", err), http.StatusInternalServerError)
@@ -3150,6 +3194,33 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "No images found for chapter", http.StatusInternalServerError)
 		return
 	}
+
+	// Only now that the images are confirmed, delete the existing chapter
+	// directory and reset its state under the lock.
+	s.chapterStateMu.Lock()
+	chapterState, err = s.loadChapterStateLocked(folderName)
+	if err != nil || chapterState == nil {
+		s.chapterStateMu.Unlock()
+		http.Error(w, "No chapter state found", http.StatusNotFound)
+		return
+	}
+	chInfo, exists := chapterState.Chapters[chapterKey]
+	if !exists {
+		s.chapterStateMu.Unlock()
+		http.Error(w, fmt.Sprintf("Chapter %s not found in state", chapterKey), http.StatusNotFound)
+		return
+	}
+	os.RemoveAll(filepath.Join(s.config.DownloadPath, folderName, "Chapter "+chapterKey))
+	chInfo.Downloaded = false
+	chInfo.ImageCount = 0
+	chInfo.DownloadedAt = time.Time{}
+	chInfo.PerImageStatus = nil
+	chapterState.Chapters[chapterKey] = chInfo
+
+	if err := s.saveChapterStateLocked(folderName, chapterState); err != nil {
+		log.Printf("[REDOWNLOAD-CHAPTER] Failed to save chapter state before redownload: %v", err)
+	}
+	s.chapterStateMu.Unlock()
 
 	dl := models.NewDownload(series.ID, chapter.ID, series.Title, chapter.Title)
 	dl.ID = uuid.New().String()
@@ -3689,7 +3760,10 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	// Update H-Manga manager in-place (do NOT recreate — its browser profile persists)
 	if s.hmangaMgr != nil {
-		s.hmangaMgr.UpdateConfig(s.config)
+		// Create a copy of the config to avoid race conditions with concurrent readers
+		cfgCopy := &config.Config{}
+		*cfgCopy = *s.config
+		s.hmangaMgr.UpdateConfig(cfgCopy)
 	}
 
 	// Update download manager in place rather than replacing it: download
@@ -3799,7 +3873,7 @@ func (s *Server) saveRegistry(registry *SeriesRegistry) error {
 		return fmt.Errorf("failed to marshal registry: %w", err)
 	}
 
-	if err := os.WriteFile(registryPath, data, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(registryPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write registry file: %w", err)
 	}
 
@@ -4244,6 +4318,12 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 	// Downloaded: false or the chapter key is absent, it needs downloading.
 	sortedChapterKeys := make([]string, 0, len(chapterState.Chapters))
 	for chapterKey := range chapterState.Chapters {
+		// Validate chapter key to prevent path traversal attacks
+		// Only allow chapter keys that are valid numbers (e.g., "1", "1.5", "10")
+		if !isValidChapterKey(chapterKey) {
+			log.Printf("[SYNC] Skipping invalid chapter key: %q", chapterKey)
+			continue
+		}
 		sortedChapterKeys = append(sortedChapterKeys, chapterKey)
 	}
 	sort.Slice(sortedChapterKeys, func(i, j int) bool {
@@ -4441,7 +4521,7 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 
 			if dl.Status == models.StatusCompleted && actualFiles == 0 {
 				log.Printf("[SYNC] Chapter %s (%s) reported completed but folder has 0 files, marking as partial", chapterKey, seriesName)
-				dl.Status = models.StatusPartial
+				dl.MarkPartial()
 			}
 
 			// Mark as downloaded if complete, or if all remaining images were
@@ -4461,6 +4541,7 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 				chInfo.PerImageStatus = task.ImageResults
 			}
 			task.Mu.Unlock()
+			// Copy the updated info back to the chapterState map
 			chapterState.Chapters[chapterKey] = chInfo
 			downloadedCount++
 
@@ -5586,7 +5667,7 @@ function showToast(message, type = 'info') {
 // Escape helpers used throughout the UI for safe HTML/attribute/onclick string construction
 function escapeHtml(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function escapeAttr(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-function escapeOnclick(s) { return (s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+function escapeOnclick(s) { return (s || '').replace(/&/g, '&amp;').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
 function escapeJsString(s) { return escapeOnclick(s).replace(/\$/g, '\\$'); }
 // Add series form
 document.getElementById('add-series-form').addEventListener('submit', async (e) => {

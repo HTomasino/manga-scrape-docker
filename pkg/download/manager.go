@@ -105,10 +105,9 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 	m.workerPool <- struct{}{}
 	defer func() { <-m.workerPool }()
 
-	// Update status to downloading
+	// Update status to downloading - using a helper that ensures proper mutex usage
+	download.UpdateProgress(0, len(task.Images))
 	download.Status = models.StatusDownloading
-	download.ImageCount = len(task.Images)
-	download.DownloadedCount = 0
 	download.UpdatedAt = time.Now()
 	m.notifyProgress(download)
 
@@ -131,11 +130,12 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 	// Create output directory
 	chapterNum := strconv.FormatFloat(task.ChapterNumber, 'f', -1, 64)
 	if chapterNum == "0" {
-		chapterNum = "1"
+		log.Printf("[DOWNLOAD] Skipping unnumbered chapter: %.1f in %s", task.ChapterNumber, task.CustomName)
+		return nil
 	}
 	chapterDir := filepath.Join(downloadPath, task.CustomName, "Chapter "+chapterNum)
 	if err := m.fileOps.EnsureDir(chapterDir); err != nil {
-		download.Status = models.StatusFailed
+		download.MarkFailed()
 		download.UpdatedAt = time.Now()
 		m.notifyProgress(download)
 		return fmt.Errorf("failed to create directory: %w", err)
@@ -169,8 +169,7 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 		// truncated file left by a crash should be re-downloaded.
 		if info, err := os.Stat(destPath); err == nil && info.Size() > 0 {
 			downloadedCount++
-			download.DownloadedCount = downloadedCount
-			download.Progress = float64(downloadedCount) / float64(totalImages) * 100
+			download.UpdateProgress(downloadedCount, totalImages)
 			download.UpdatedAt = time.Now()
 			m.notifyProgress(download)
 			imageResults[i] = models.ImageResult{
@@ -217,8 +216,7 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 				}
 				// Fallback succeeded
 				downloadedCount++
-				download.DownloadedCount = downloadedCount
-				download.Progress = float64(downloadedCount) / float64(totalImages) * 100
+				download.UpdateProgress(downloadedCount, totalImages)
 				download.UpdatedAt = time.Now()
 				m.notifyProgress(download)
 				imageResults[i] = models.ImageResult{
@@ -242,8 +240,7 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 		}
 
 		downloadedCount++
-		download.DownloadedCount = downloadedCount
-		download.Progress = float64(downloadedCount) / float64(len(task.Images)) * 100
+		download.UpdateProgress(downloadedCount, len(task.Images))
 		download.UpdatedAt = time.Now()
 		m.notifyProgress(download)
 		imageResults[i] = models.ImageResult{
@@ -284,7 +281,7 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 	// (or failed if nothing usable was downloaded). If all images were
 	// filtered, it's partial with 0 files so the caller can mark it
 	// intentionally skipped.
-	effectiveCount := downloadedCount + skippedCount
+	effectiveCount := downloadedCount
 	nonFilteredCount := len(task.Images) - filteredCount
 	if nonFilteredCount <= 0 {
 		nonFilteredCount = len(task.Images)

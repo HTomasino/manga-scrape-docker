@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -57,30 +59,89 @@ func readChromePID(userDataDir string) (int, bool) {
 	return pid, true
 }
 
-// readChromePIDFromLockfile returns the PID that Chrome wrote to its
-// profile lockfile when it started, or 0 if the lockfile is missing,
-// unreadable, or malformed.
-//
-// Chrome writes a small lockfile inside the user-data directory whose
-// contents are the PID of its main browser process. We use this as the
-// source of truth for the PID we should track for orphan cleanup, since the
-// Playwright API does not expose the spawned Chrome PID directly.
-//
-// If Chrome is still holding the lockfile exclusively, this returns 0 and
-// logs nothing — the caller will simply skip recording and the next launch
-// will retry.
-func readChromePIDFromLockfile(userDataDir string) int {
-	lockPath := filepath.Join(userDataDir, "lockfile")
-	data, err := os.ReadFile(lockPath)
+// getChromePIDFromSingletonLock reads the PID from Chrome's SingletonLock symlink on Linux.
+// On Linux, Chrome creates a symbolic link at "SingletonLock" that points to a file named after the host and PID,
+// e.g. "/tmp/.org.chromium.Chromium.ABCDEF.12345"
+func getChromePIDFromSingletonLock(userDataDir string) (int, bool) {
+	if runtime.GOOS != "linux" {
+		return 0, false
+	}
+
+	lockPath := filepath.Join(userDataDir, "SingletonLock")
+	info, err := os.Lstat(lockPath)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return 0, false
+	}
+
+	target, err := os.Readlink(lockPath)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	s := strings.TrimSpace(string(data))
-	pid, err := strconv.Atoi(s)
+
+	// Target format: "/tmp/.org.chromium.Chromium.ABCDEF.12345"
+	// Extract PID from the last part (after the final dot)
+	parts := strings.Split(target, ".")
+	if len(parts) < 2 {
+		return 0, false
+	}
+
+	pidStr := parts[len(parts)-1]
+	pid, err := strconv.Atoi(pidStr)
 	if err != nil || pid <= 0 {
-		return 0
+		return 0, false
 	}
-	return pid
+
+	return pid, true
+}
+
+// getChromePIDFromWindowsProcessList resolves Chrome PID from process list on Windows.
+// Uses PowerShell to query Win32_Process for Chrome processes with matching user-data directory.
+func getChromePIDFromWindowsProcessList(userDataDir string) (int, bool) {
+	if runtime.GOOS != "windows" {
+		return 0, false
+	}
+
+	// Try using PowerShell command to find chrome.exe processes with the userDataDir in their command line
+	cmd := fmt.Sprintf(`Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe' AND CommandLine LIKE '%s%%'" | Select-Object -First 1 ProcessId`, strings.ReplaceAll(userDataDir, `\`, `\\`))
+	output, err := exec.Command("powershell", "-Command", cmd).Output()
+	if err != nil {
+		return 0, false
+	}
+
+	// Parse output to extract PID from the first matching process
+	outputStr := string(output)
+	lines := strings.Split(strings.TrimSpace(outputStr), "\n")
+	for _, line := range lines[1:] { // Skip header
+		line = strings.TrimSpace(line)
+		if line != "" {
+			pid, err := strconv.Atoi(strings.Fields(line)[0])
+			if err == nil && pid > 0 {
+				return pid, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+// getChromePID returns the Chrome PID from either SingletonLock (Linux) or process list (Windows).
+// On other OSes it tries to read from scraper.pid file.
+func getChromePID(userDataDir string) (int, bool) {
+	if runtime.GOOS == "linux" {
+		pid, ok := getChromePIDFromSingletonLock(userDataDir)
+		if ok {
+			return pid, true
+		}
+	} else if runtime.GOOS == "windows" {
+		pid, ok := getChromePIDFromWindowsProcessList(userDataDir)
+		if ok {
+			return pid, true
+		}
+	}
+
+	// Fallback to reading scraper.pid file (for compatibility with older versions)
+	pid, ok := readChromePID(userDataDir)
+	return pid, ok
 }
 
 // cleanOrphanChrome inspects userDataDir for a previously-recorded Chrome PID.
@@ -92,27 +153,31 @@ func readChromePIDFromLockfile(userDataDir string) int {
 // (e.g. WMIC unavailable, command-line truncated), the PID is NOT killed.
 // This avoids terminating unrelated Chrome windows the user has open.
 func cleanOrphanChrome(userDataDir string) {
-	pid, ok := readChromePID(userDataDir)
+	pid, ok := getChromePID(userDataDir)
 	if !ok {
 		return
 	}
+
 	if !pidAlive(pid) {
 		// PID no longer exists; the file is stale. Clear it and move on.
 		ClearChromePID(userDataDir)
 		return
 	}
+
 	cmdline := processCommandLine(pid)
 	if cmdline == "" {
 		// Cannot verify ownership — be conservative and leave the PID alone.
 		log.Printf("[BROWSER-CLEANUP] PID %d is alive but its command line could not be read; skipping cleanup to avoid touching unrelated Chrome windows", pid)
 		return
 	}
+
 	if !strings.Contains(cmdline, userDataDir) {
 		// PID belongs to a different Chrome instance that just happens to have
 		// the same PID recycled by the OS. Do not kill.
 		log.Printf("[BROWSER-CLEANUP] PID %d is alive but does not reference our user-data dir (%s); skipping", pid, userDataDir)
 		return
 	}
+
 	log.Printf("[BROWSER-CLEANUP] Found orphan Chrome (PID %d) from a previous scraper session; killing before new launch", pid)
 	killChromeTree(pid)
 	// Give the OS a moment to release the profile lockfile after the process

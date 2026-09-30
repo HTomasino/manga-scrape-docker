@@ -942,7 +942,7 @@ window.chrome = window.chrome || { runtime: {} };
 
 	// Record the Chrome PID so a future launch can clean up orphans if this
 	// scraper process is killed before normal shutdown runs.
-	if pid := readChromePIDFromLockfile(userDataDir); pid > 0 {
+	if pid, ok := getChromePID(userDataDir); ok && pid > 0 {
 		if err := recordChromePID(userDataDir, pid); err != nil {
 			log.Printf("[%s] Warning: failed to record Chrome PID: %v", logPrefix, err)
 		} else {

@@ -94,6 +94,12 @@ func (s *Scraper) ExtractChapters(htmlStr string, baseURL string) ([]models.Chap
 			number = scraper.ParseChapterNumber(fullURL)
 		}
 
+		// If we still don't have a valid chapter number, skip this chapter
+		if number == 0 {
+			log.Printf("[RAVENSCANS-EXTRACT] Skipping unnumbered chapter: %s", fullURL)
+			return
+		}
+
 		title := strings.TrimSpace(a.Find(".chapternum").Text())
 		if title == "" {
 			title = strings.TrimSpace(a.Text())
