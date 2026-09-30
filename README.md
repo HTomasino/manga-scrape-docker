@@ -17,6 +17,7 @@ A Go-based manga/comic downloader with both a CLI and a local Web UI. Tracks ser
 - **Resume support** -- chapter state is persisted per series; re-adding a series reuses the existing folder
 - **Background browser mode** -- headed Chrome (ManhuaUS, DrakeComic) runs off-screen so it never steals focus
 - **XSS-safe HTML** rendering in the web UI (escaped attributes, text, and inline `onclick` handlers)
+- **Pause/Resume** the global manga scraping scheduler (persists across restarts)
 
 ## Supported Sites
 
@@ -57,7 +58,7 @@ A Go-based manga/comic downloader with both a CLI and a local Web UI. Tracks ser
 |   +-- models/           # Series, Chapter, Download, ImageResult
 |   +-- scraper/          # Site scrapers
 |       +-- asura/
-|       +-- browser/      # Shared persistent-context launch (off-screen)
+|       +-- browser      # Shared persistent-context launch (off-screen)
 |       +-- demonic/
 |       +-- drake/
 |       +-- lua/
@@ -219,7 +220,6 @@ The single-page app is served from `/` and the embedded JavaScript/CSS lives und
 | `/api/series/{id}/scan-missing` | POST | Re-download incomplete chapters |
 | `/api/series/{id}/force-redownload` | POST | Range `{fromChapter,toChapter}` |
 | `/api/series/{id}/redownload-chapter` | POST | Single chapter re-download |
-| `/api/series/{id}/refresh-metadata` | POST | Re-fetch `series-info.json` + cover |
 | `/api/series/recheck-all` | POST | Reconcile every series against disk (paused-aware) |
 | `/api/download` | POST | Start a chapter download |
 | `/api/downloads` | GET | List active downloads |
@@ -349,7 +349,7 @@ With `hmangaExtractZips` enabled, each ZIP is extracted and deleted after a succ
 
 Downloaded ZIP names have the `hmangaZipNameRegex` pattern applied (default strips `[tag]` groups and underscores, e.g. `[Artist] Title_12345.zip` ? `Title12345.zip`). When extraction is enabled, `.books.json` marks the book with `"extracted": true` and `"dirName": "<book zip name>"`; disk verification then checks the extracted folder instead of the ZIP. A downloaded book whose ZIP is missing but whose same-named extracted directory exists is adopted as extracted on the next verification pass (manually extracted books are not re-downloaded).
 
-**Clean Up Zips** (button in the H-Manga section, `POST /api/hmanga/artists/cleanup-zips`) scans every artist folder for existing ZIPs, renames any whose name still matches the configured regex (skipping renames where the target already exists), and — when `hmangaExtractZips` is enabled — extracts each ZIP and deletes it. `.books.json` filenames are updated to match, and the global cache is rebuilt. The scan is single-flight (a second click while running gets a 409) and its summary counts are logged.
+**Clean Up Zips** (button in the H-Manga section, `POST /api/hmanga/artists/cleanup-zips`) scans every artist folder for existing ZIPs, renames any whose name still matches the configured regex (skipping renames where the target already exists), and â€” when `hmangaExtractZips` is enabled -- extracts each ZIP and deletes it. `.books.json` filenames are updated to match, and the global cache is rebuilt. The scan is single-flight (a second click while running gets a 409) and its summary counts are logged.
 
 The global cross-artist book cache lives at `%APPDATA%\comic-scraper\hmanga-global-books.json` and is rebuilt/validated from per-artist `.books.json` files at startup.
 
@@ -368,7 +368,7 @@ cli config-set -key browserBackground -val true    # off-screen (default)
 
 - **No pages found** -- site HTML may have changed; try `cli config-set -key rateDelay -val 1000` to slow down, or re-run **Check Now**.
 - **Cloudflare blocks ManhuaUS / DrakeComic** -- ensure `browserBackground` is enabled (default) and Playwright is installed.
-- **HentaiNexus login fails** -- set `hentaiNexusUsername` and `hentaiNexusPassword` in `config.json` or via the web UI.
+- **HentaiNexus login fails** -- set `hentaiNexusUsername` and `hentaiNexusPassword` in config.json or via the web UI.
 - **Duplicate covers / tiny images** -- raise `minImageSizeKB`, `minImageWidth`, or `minImageHeight`. Pages filtered by these settings are recorded with `status: "filtered"` and will not be retried.
 - **H-Manga "already downloaded" but no file** -- run **Recheck All** (web) or set `verifyHMDownloads: true` so the next startup verifies ZIPs / extracted folders against disk.
 - **H-Manga extraction failed** -- the ZIP is kept on disk and the download is retried on the next sync; check the log for the reason (locked file, corrupt archive).
@@ -399,4 +399,5 @@ require (
 MIT
 
 ## Releases
-- **1.0.0** — 2026-09-30: browser/CDP and H-Manga enhancements
+
+- **1.7.2** â€” 2026-09-30: browser/CDP and H-Manga enhancements
