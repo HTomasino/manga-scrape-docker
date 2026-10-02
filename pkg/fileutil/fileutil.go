@@ -262,14 +262,17 @@ func decodeWebPDimensions(r io.ReadSeeker) (int, int, error) {
 // writers (config, chapter state, images) should use this instead of
 // os.WriteFile directly.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmpPath := path + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmpFile, err := os.CreateTemp(dir, base+".tmp.*")
 	if err != nil {
-		return fmt.Errorf("failed to create temp file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	f := tmpFile
 	if _, err := f.Write(data); err != nil {
 		f.Close()
-		os.Remove(tmpPath)
 		return fmt.Errorf("failed to write temp file %s: %w", tmpPath, err)
 	}
 	// Sync before rename: power-loss durability requires the data to be on
@@ -277,11 +280,9 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	// writable — Windows rejects Sync on a read-only handle.
 	if err := f.Sync(); err != nil {
 		f.Close()
-		os.Remove(tmpPath)
 		return fmt.Errorf("failed to sync temp file %s: %w", tmpPath, err)
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
 		return fmt.Errorf("failed to close temp file %s: %w", tmpPath, err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/playwright-community/playwright-go"
@@ -84,12 +85,13 @@ func parseJSONCookies(data []byte) ([]playwright.OptionalCookie, error) {
 		}
 		// Playwright wants "Strict" | "Lax" | "None"; the exporter may
 		// provide lowercase or "no_restriction"/"lax"/"strict" styles.
+		// "no_restriction" means no SameSite constraint → map to None.
 		switch c.SameSite {
-		case "Strict", "strict", "strictly", "no_restriction":
+		case "Strict", "strict", "strictly":
 			pc.SameSite = playwright.SameSiteAttributeStrict
 		case "Lax", "lax":
 			pc.SameSite = playwright.SameSiteAttributeLax
-		case "None", "none":
+		case "None", "none", "no_restriction":
 			pc.SameSite = playwright.SameSiteAttributeNone
 		}
 		out = append(out, pc)
@@ -104,7 +106,16 @@ func parseJSONCookies(data []byte) ([]playwright.OptionalCookie, error) {
 func parseNetscapeCookies(text string) ([]playwright.OptionalCookie, error) {
 	out := make([]playwright.OptionalCookie, 0, 32)
 	for _, line := range splitLines(text) {
-		if line == "" || line[0] == '#' {
+		if line == "" {
+			continue
+		}
+		// Handle #HttpOnly_ prefix: strip it and mark the cookie as HttpOnly.
+		isHttpOnly := false
+		if strings.HasPrefix(line, "#HttpOnly_") {
+			line = line[10:] // strip "#HttpOnly_"
+			isHttpOnly = true
+		}
+		if line[0] == '#' {
 			continue
 		}
 		fields := splitTabFields(line)
@@ -116,11 +127,12 @@ func parseNetscapeCookies(text string) ([]playwright.OptionalCookie, error) {
 			continue
 		}
 		pc := playwright.OptionalCookie{
-			Name:   name,
-			Value:  value,
-			Domain: playwright.String(domain),
-			Path:   playwright.String(path),
-			Secure: playwright.Bool(secure == "TRUE" || secure == "true"),
+			Name:     name,
+			Value:    value,
+			Domain:   playwright.String(domain),
+			Path:     playwright.String(path),
+			Secure:   playwright.Bool(secure == "TRUE" || secure == "true"),
+			HttpOnly: playwright.Bool(isHttpOnly),
 		}
 		// A leading dot on the domain marks it as a domain cookie — Playwright
 		// wants the leading dot preserved so subdomains match, which the

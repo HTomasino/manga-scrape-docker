@@ -190,7 +190,25 @@ func cleanOrphanChrome(userDataDir string) {
 // exclusively held, up to a few seconds. After killChromeTree Chrome usually
 // releases the lock within a few hundred milliseconds; the wait is bounded so
 // we never block the launch path indefinitely.
+//
+// On non-Windows (Linux), Chrome uses a SingletonLock symlink instead of a
+// lockfile. This function polls for the existence of the SingletonLock symlink
+// rather than trying to open a lockfile, which would fail on Linux.
 func waitForLockRelease(userDataDir string) {
+	if runtime.GOOS != "windows" {
+		// On Linux, Chrome uses SingletonLock symlink; poll for its existence
+		singletonLockPath := filepath.Join(userDataDir, "SingletonLock")
+		const maxAttempts = 20 // ~4s at 200ms intervals
+		for i := 0; i < maxAttempts; i++ {
+			if _, err := os.Lstat(singletonLockPath); err != nil {
+				// Symlink no longer exists (Chrome released it)
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		log.Printf("[BROWSER-CLEANUP] SingletonLock %s still appears held after kill; launching anyway (Chrome will surface any error)", singletonLockPath)
+		return
+	}
 	lockPath := filepath.Join(userDataDir, "lockfile")
 	const maxAttempts = 20 // ~4s at 200ms intervals
 	for i := 0; i < maxAttempts; i++ {

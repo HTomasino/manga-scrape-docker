@@ -1,6 +1,7 @@
 package models
 
 import (
+	"sync"
 	"time"
 )
 
@@ -134,6 +135,14 @@ type Download struct {
 	BytesDownloaded int64 `json:"bytesDownloaded,omitempty"`
 	// TotalBytes is the expected final size when known (H-Manga only).
 	TotalBytes int64 `json:"totalBytes,omitempty"`
+
+	// Mu protects the mutable fields above (Status, Progress, ImageCount,
+	// DownloadedCount, UpdatedAt, PerImageStatus) when a live *Download is
+	// shared between the download manager goroutine and web handlers.
+	// It is a pointer so value copies of Download stay lock-copy-safe for
+	// go vet and encoding. Lock order: Mu before the server's s.mu, never
+	// reverse. Initialized by NewDownload; snapshotDownload nil-checks.
+	Mu *sync.Mutex `json:"-"`
 }
 
 // Image represents a comic page image
@@ -207,6 +216,7 @@ func NewDownload(seriesID, chapterID, seriesTitle, chapterTitle string) *Downloa
 		Status:       StatusPending,
 		CreatedAt:    now,
 		UpdatedAt:    now,
+		Mu:           &sync.Mutex{},
 	}
 }
 

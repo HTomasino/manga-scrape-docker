@@ -303,14 +303,16 @@ func (m *HentaiNexusManager) waitInflightWithTimeout() {
 	done := make(chan struct{})
 	go func() {
 		for {
+			// Check and park under ONE mutex hold: a check-then-Wait split
+			// across two holds lets opDone's Broadcast fire while the waiter
+			// is between holds (a no-op wake), parking it until the timeout
+			// even though active is already 0.
 			m.activeMu.Lock()
-			active := m.active
-			m.activeMu.Unlock()
-			if active == 0 {
+			if m.active == 0 {
+				m.activeMu.Unlock()
 				close(done)
 				return
 			}
-			m.activeMu.Lock()
 			m.activeCond.Wait()
 			m.activeMu.Unlock()
 			select {
@@ -324,6 +326,8 @@ func (m *HentaiNexusManager) waitInflightWithTimeout() {
 
 	progress := time.NewTicker(5 * time.Second)
 	defer progress.Stop()
+	deadlineTimer := time.NewTimer(time.Until(deadline))
+	defer deadlineTimer.Stop()
 
 	for {
 		select {
@@ -337,10 +341,7 @@ func (m *HentaiNexusManager) waitInflightWithTimeout() {
 			if active > 0 {
 				log.Printf("[HMANGA] Stop: waiting for %d in-flight op(s) to finish (%v remaining)", active, remaining.Round(time.Second))
 			}
-		case <-time.After(time.Until(deadline)):
-			if time.Now().Before(deadline) {
-				continue
-			}
+		case <-deadlineTimer.C:
 			m.activeMu.Lock()
 			stillActive := m.active
 			// ORDERING INVARIANT -- see the function-level comment.
@@ -519,15 +520,14 @@ func (m *HentaiNexusManager) ExtractBooks(artistURL string) ([]Book, error) {
 	}
 	defer func() { <-m.scrapeSem }()
 
-	var books []Book
-	err := m.browserQueue.RunWithPageKeyed("hmanga:extract:"+artistURL, func(page playwright.Page) error {
+	books, err := browser.RunWithPageKeyedVal(m.browserQueue, "hmanga:extract:"+artistURL, func(page playwright.Page) ([]Book, error) {
 		seen := make(map[string]Book)
 		current := artistURL
 		for pageNum := 1; pageNum <= maxPagination; pageNum++ {
 			if _, err := page.Goto(current, playwright.PageGotoOptions{
 				WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 			}); err != nil {
-				return fmt.Errorf("navigate to artist page: %w", err)
+				return nil, fmt.Errorf("navigate to artist page: %w", err)
 			}
 
 			// Collect book links via in-page JS: all a[href*="/view/"] inside .column cards.
@@ -555,7 +555,7 @@ func (m *HentaiNexusManager) ExtractBooks(artistURL string) ([]Book, error) {
 				return out;
 			}`)
 			if err != nil {
-				return fmt.Errorf("extract books: %w", err)
+				return nil, fmt.Errorf("extract books: %w", err)
 			}
 
 			items, _ := result.([]interface{})
@@ -580,7 +580,7 @@ func (m *HentaiNexusManager) ExtractBooks(artistURL string) ([]Book, error) {
 			if err != nil {
 				// A locator error here means pagination state is unknown —
 				// surface it instead of silently reporting a truncated list.
-				return fmt.Errorf("check pagination: %w", err)
+				return nil, fmt.Errorf("check pagination: %w", err)
 			}
 			if nextURL == "" {
 				break
@@ -592,9 +592,17 @@ func (m *HentaiNexusManager) ExtractBooks(artistURL string) ([]Book, error) {
 		for _, b := range seen {
 			bs = append(bs, b)
 		}
-		sort.Slice(bs, func(i, j int) bool { return bs[i].ID > bs[j].ID })
-		books = bs
-		return nil
+		// Numeric-aware newest-first: ID 9 must sort before 10 (string
+		// compare would order "9" > "10").
+		sort.Slice(bs, func(i, j int) bool {
+			ni, erri := strconv.Atoi(bs[i].ID)
+			nj, errj := strconv.Atoi(bs[j].ID)
+			if erri == nil && errj == nil {
+				return ni > nj
+			}
+			return bs[i].ID > bs[j].ID
+		})
+		return bs, nil
 	})
 	if err != nil {
 		return nil, err
@@ -614,6 +622,9 @@ func nextPaginationURL(page playwright.Page, artistURL, artistName string, curre
 	for _, l := range links {
 		href, err := l.GetAttribute("href")
 		if err != nil || href == "" {
+			if err != nil {
+				log.Printf("[HMANGA] pagination: failed to get href attribute: %v", err)
+			}
 			continue
 		}
 		u, err := url.Parse(href)

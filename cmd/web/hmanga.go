@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,18 @@ import (
 	"github.com/user/comic-scraper/pkg/hmanga"
 	"github.com/user/comic-scraper/pkg/models"
 )
+
+// hmangaBookIDGreater orders book IDs newest-first, comparing numerically
+// when both parse as ints (so ID 9 sorts before 10) and falling back to
+// string order otherwise.
+func hmangaBookIDGreater(a, b string) bool {
+	na, ea := strconv.Atoi(a)
+	nb, eb := strconv.Atoi(b)
+	if ea == nil && eb == nil {
+		return na > nb
+	}
+	return a > b
+}
 
 // registerHMangaCallback wires the idle-timeout active-download callback and
 // the live download progress callback. It is called during server startup
@@ -61,6 +74,17 @@ func (s *Server) handleHMangaDownloadProgress(p hmanga.HentaiNexusManagerDownloa
 			queuePhase = "" // suppress queue signaling for unknown/stale records
 			return
 		}
+
+		// Guard the struct mutation with dl.Mu too: readers copy the struct
+		// under dl.Mu (snapshotDownload) while holding s.mu.RLock.
+		if dl.Mu != nil {
+			dl.Mu.Lock()
+		}
+		defer func() {
+			if dl.Mu != nil {
+				dl.Mu.Unlock()
+			}
+		}()
 
 		// Ignore stale "downloading" ticks that arrive after a final phase has
 		// already been applied to this record.
@@ -458,7 +482,10 @@ func (s *Server) updateHMangaRegistryEntry(artistID string, updateFn func(*hmang
 			if a, ok := s.hmangaArtists[artistID]; ok {
 				*a = s.hmangaRegistry.Artists[i]
 			} else {
-				s.hmangaArtists[artistID] = &s.hmangaRegistry.Artists[i]
+				// Store a heap copy, not &Artists[i]: a later append can
+				// reallocate the slice and dangle a raw slice pointer.
+				c := s.hmangaRegistry.Artists[i]
+				s.hmangaArtists[artistID] = &c
 			}
 			s.saveHMangaRegistry()
 			return true
@@ -901,7 +928,7 @@ func (s *Server) scanHMangaArtists() error {
 		bookCount := len(st.Books)
 		s.hmangaStateMu.Unlock()
 
-		sort.Slice(bookCache, func(i, j int) bool { return bookCache[i].ID > bookCache[j].ID })
+		sort.Slice(bookCache, func(i, j int) bool { return hmangaBookIDGreater(bookCache[i].ID, bookCache[j].ID) })
 		s.mu.Lock()
 		s.hmangaBooks[artistID] = bookCache
 		if a, ok := s.hmangaArtists[artistID]; ok {
@@ -1054,9 +1081,9 @@ func generateHMangaID(name string) string {
 // handleListHMArtists returns all tracked H-Manga artists.
 func (s *Server) handleListHMArtists(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
-	list := make([]*hmanga.Artist, 0, len(s.hmangaArtists))
+	list := make([]hmanga.Artist, 0, len(s.hmangaArtists))
 	for _, a := range s.hmangaArtists {
-		list = append(list, a)
+		list = append(list, *a)
 	}
 	s.mu.RUnlock()
 
@@ -1295,6 +1322,9 @@ func (s *Server) scrapeAndDownloadHMArtist(artistID, artistURL, folderName, opID
 	st.URL = artistURL
 	st.LastSynced = now
 	s.mergeHMBooksIntoState(st, books)
+	// Persist the merged state: without this, discovered books exist only in
+	// memory and are lost on restart (refreshHMArtistBooks saves; this path didn't).
+	s.saveAndSyncHMangaBookState(st)
 
 	// Update in-memory book cache + registry counts.
 	s.mu.Lock()
@@ -1412,7 +1442,7 @@ func (s *Server) handleListHMBooks(w http.ResponseWriter, r *http.Request, artis
 				sorted = append(sorted, hmanga.Book{ID: id, Title: b.Title, URL: b.URL})
 			}
 			s.hmangaStateMu.Unlock()
-			sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID > sorted[j].ID })
+			sort.Slice(sorted, func(i, j int) bool { return hmangaBookIDGreater(sorted[i].ID, sorted[j].ID) })
 			out = append(out, sorted...)
 		}
 	}
@@ -2006,7 +2036,7 @@ func (s *Server) autoDownloadMissingBooks(artistID string, manual ...bool) {
 		booksSnapshot[id] = info
 	}
 	s.hmangaStateMu.Unlock()
-	sort.Slice(ids, func(i, j int) bool { return ids[i] > ids[j] })
+	sort.Slice(ids, func(i, j int) bool { return hmangaBookIDGreater(ids[i], ids[j]) })
 
 	var wg sync.WaitGroup
 	for _, id := range ids {

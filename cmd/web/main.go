@@ -543,8 +543,14 @@ func (s *Server) handleDownloadProgress(dl *models.Download) {
 	s.downloads[dl.ID] = dl
 	s.mu.Unlock()
 
+	// Snapshot the status under dl.Mu: the manager mutates the live struct
+	// concurrently, and the async updateChapterState below reads dl fields.
+	dl.Mu.Lock()
+	status := dl.Status
+	dl.Mu.Unlock()
+
 	// Update series chapter count if completed
-	if dl.Status == models.StatusCompleted || dl.Status == models.StatusPartial {
+	if status == models.StatusCompleted || status == models.StatusPartial {
 		s.mu.Lock()
 		if series, ok := s.series[dl.SeriesID]; ok {
 			series.ChaptersDownloaded++
@@ -559,10 +565,49 @@ func (s *Server) handleDownloadProgress(dl *models.Download) {
 	}
 }
 
+// snapshotDownload copies a live *models.Download under its mutex. The
+// copied Mu pointer is dropped so the value copy is safe to encode or hand
+// around without go vet lock-copy complaints.
+// stableChapterID derives a refresh-stable chapter ID from the series ID and
+// the chapter's number/URL, so IDs do not shift when the site inserts or
+// removes chapters between refreshes.
+func stableChapterID(seriesID string, ch models.Chapter) string {
+	h := fnv.New32a()
+	h.Write([]byte(strconv.FormatFloat(ch.Number, 'f', -1, 64)))
+	h.Write([]byte{0})
+	h.Write([]byte(ch.URL))
+	return fmt.Sprintf("ch-%s-%x", seriesID, h.Sum32())
+}
+
+// snapshotSeriesValue copies a *models.Series by value under the caller-held
+// s.mu read lock, so fields read after RUnlock cannot be torn by a concurrent
+// rename/update mutating the shared struct.
+func snapshotSeriesValue(live *models.Series) models.Series {
+	cp := *live
+	return cp
+}
+
+func snapshotDownload(live *models.Download) models.Download {
+	if live.Mu != nil {
+		live.Mu.Lock()
+	}
+	cp := *live
+	if live.Mu != nil {
+		live.Mu.Unlock()
+	}
+	cp.Mu = nil
+	return cp
+}
+
 // updateChapterState updates the chapter state in the series folder
-func (s *Server) updateChapterState(seriesID, chapterID string, dl *models.Download) {
+func (s *Server) updateChapterState(seriesID, chapterID string, liveDL *models.Download) {
+	// Snapshot the live download under its mutex: the manager mutates the
+	// struct concurrently, and the reads below happen in a background goroutine.
+	dl := snapshotDownload(liveDL)
+
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesLive, ok := s.series[seriesID]
+	series := snapshotSeriesValue(seriesLive)
 	s.mu.RUnlock()
 
 	if !ok {
@@ -613,7 +658,7 @@ func (s *Server) updateChapterState(seriesID, chapterID string, dl *models.Downl
 	// applyChapterCompletion is the single owner of the completion predicate
 	// (completed, or all remaining images intentionally filtered) shared by
 	// every completion-writing site.
-	downloaded := isDownloadComplete(dl)
+	downloaded := isDownloadComplete(&dl)
 	if chInfo, ok := chapterState.Chapters[chapterKey]; ok {
 		chInfo.Downloaded = downloaded
 		chInfo.ImageCount = dl.ImageCount
@@ -658,6 +703,9 @@ func (s *Server) startUpdateScheduler() {
 	}
 	s.schedulerRunning = true
 	s.schedulerStop = make(chan bool)
+	// Capture the channel for THIS scheduler run: the field is replaced on a
+	// later start, and the goroutine must not observe the new channel.
+	stopCh := s.schedulerStop
 	s.mu.Unlock()
 
 	log.Printf("Starting series update scheduler (checks every minute)")
@@ -697,7 +745,7 @@ func (s *Server) startUpdateScheduler() {
 						s.checkHMangaArtistsForUpdates()
 					}
 				}()
-			case <-s.schedulerStop:
+			case <-stopCh:
 				log.Printf("Update scheduler stopped")
 				return
 			}
@@ -1007,13 +1055,17 @@ func (s *Server) checkSeriesForUpdates() {
 			s.mu.Unlock()
 			safeGoTrackSeries := series // capture loop variable
 			s.safeGoTrack("autoCheckSeries", func() {
+				// Deferred so a panic in refresh/auto-download cannot leave
+				// the series stuck in the checking map forever.
+				defer func() {
+					s.mu.Lock()
+					delete(s.checking, safeGoTrackSeries.ID)
+					s.mu.Unlock()
+				}()
 				newChapters := s.refreshSeriesChapters(safeGoTrackSeries)
 				if newChapters > 0 {
 					s.autoDownloadMissingChapters(safeGoTrackSeries.ID, true)
 				}
-				s.mu.Lock()
-				delete(s.checking, safeGoTrackSeries.ID)
-				s.mu.Unlock()
 			})
 		}
 	}
@@ -1625,9 +1677,9 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 // handleListSeries returns all series
 func (s *Server) handleListSeries(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
-	seriesList := make([]*models.Series, 0, len(s.series))
-	for _, s := range s.series {
-		seriesList = append(seriesList, s)
+	seriesList := make([]models.Series, 0, len(s.series))
+	for _, ser := range s.series {
+		seriesList = append(seriesList, snapshotSeriesValue(ser))
 	}
 	s.mu.RUnlock()
 
@@ -1833,7 +1885,10 @@ func (s *Server) handleAddSeries(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Warning: Failed to save series metadata: %v", err)
 	}
 
-	// Create chapter state file in series folder
+	// Create chapter state file in series folder. If the folder is being
+	// reused (series previously removed), merge into the existing
+	// .chapters.json instead of overwriting it — a fresh all-false state
+	// would trigger a full-series re-download of chapters already on disk.
 	chapterState := &ChapterStateFile{
 		SeriesID:   seriesID,
 		FolderName: folderName,
@@ -1841,12 +1896,29 @@ func (s *Server) handleAddSeries(w http.ResponseWriter, r *http.Request) {
 		LastSynced: now,
 		Chapters:   make(map[string]ChapterInfo),
 	}
+	if existing, loadErr := s.loadChapterState(folderName); loadErr == nil && existing != nil {
+		for k, v := range existing.Chapters {
+			if !isValidChapterKey(k) {
+				continue
+			}
+			chapterState.Chapters[k] = v
+		}
+	}
 
 	for i, ch := range chapters {
-		ch.ID = fmt.Sprintf("ch-%s-%d", seriesID[:8], i)
+		ch.ID = stableChapterID(seriesID, ch)
 		chapters[i].ID = ch.ID
 
-		chapterState.Chapters[strconv.FormatFloat(ch.Number, 'f', -1, 64)] = ChapterInfo{
+		key := strconv.FormatFloat(ch.Number, 'f', -1, 64)
+		if _, exists := chapterState.Chapters[key]; exists {
+			// Keep the existing entry (preserves Downloaded/ImageCount);
+			// refresh the URL in case the site changed it.
+			info := chapterState.Chapters[key]
+			info.URL = ch.URL
+			chapterState.Chapters[key] = info
+			continue
+		}
+		chapterState.Chapters[key] = ChapterInfo{
 			Number:     ch.Number,
 			Title:      ch.Title,
 			URL:        ch.URL,
@@ -1927,7 +1999,7 @@ func (s *Server) saveSeriesMetadata(folderName string, scr scraper.Scraper, html
 	if err != nil {
 		return fmt.Errorf("failed to marshal series info: %w", err)
 	}
-	if err := os.WriteFile(infoPath, data, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(infoPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write series info: %w", err)
 	}
 
@@ -2033,10 +2105,16 @@ func (s *Server) handleUpdateSeries(w http.ResponseWriter, r *http.Request, seri
 		series.UpdatedAt = time.Now()
 	})
 
+	// Snapshot the mutated series under the lock: the refresh goroutine and
+	// the JSON response below must not read the shared pointer unlocked.
+	s.mu.RLock()
+	seriesSnap := snapshotSeriesValue(series)
+	s.mu.RUnlock()
+
 	// Refresh chapters outside the registry lock if the URL changed
 	if needRefresh {
 		s.safeGoTrack("refreshSeriesOnUpdate", func() {
-			newChapters := s.refreshSeriesChapters(series)
+			newChapters := s.refreshSeriesChapters(&seriesSnap)
 			if newChapters > 0 {
 				s.autoDownloadMissingChapters(seriesID, true)
 			}
@@ -2044,7 +2122,7 @@ func (s *Server) handleUpdateSeries(w http.ResponseWriter, r *http.Request, seri
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(series)
+	json.NewEncoder(w).Encode(seriesSnap)
 }
 
 // refreshSeriesChapters fetches chapters from the series URL and updates state.
@@ -2074,10 +2152,13 @@ func (s *Server) refreshSeriesChapters(series *models.Series) int {
 		return 0
 	}
 
-	// Update chapters in memory
+	// Update chapters in memory. IDs are derived from the chapter number and
+	// URL, NOT the slice index: an index-based ID shifts onto the wrong
+	// chapter when the site inserts/removes an entry between refreshes,
+	// marking the wrong chapter downloaded.
 	chapterPtrs := make([]*models.Chapter, len(chapters))
 	for i := range chapters {
-		chapters[i].ID = fmt.Sprintf("ch-%s-%d", series.ID[:8], i)
+		chapters[i].ID = stableChapterID(series.ID, chapters[i])
 		chapterPtrs[i] = &chapters[i]
 	}
 
@@ -2109,7 +2190,15 @@ func (s *Server) refreshSeriesChapters(series *models.Series) int {
 	// Load or create chapter state (under lock to prevent race with concurrent
 	// updateChapterState or autoDownloadMissingChapters saves)
 	s.chapterStateMu.Lock()
-	chapterState, _ := s.loadChapterStateLocked(folderName)
+	newChapterCount := 0
+	chapterState, stateLoadErr := s.loadChapterStateLocked(folderName)
+	if stateLoadErr != nil {
+		// Abort instead of overwriting history with fresh state on a
+		// transient read error.
+		s.chapterStateMu.Unlock()
+		log.Printf("Failed to load chapter state for %s during refresh: %v", folderName, stateLoadErr)
+		return newChapterCount
+	}
 	if chapterState == nil {
 		chapterState = &ChapterStateFile{
 			SeriesID:   series.ID,
@@ -2124,7 +2213,6 @@ func (s *Server) refreshSeriesChapters(series *models.Series) int {
 	chapterState.LastSynced = now
 
 	// Add new chapters, preserve existing download status
-	newChapterCount := 0
 	for _, ch := range chapters {
 		key := strconv.FormatFloat(ch.Number, 'f', -1, 64)
 		if existing, exists := chapterState.Chapters[key]; exists {
@@ -2265,7 +2353,8 @@ func (s *Server) handleCheckNow(w http.ResponseWriter, r *http.Request) {
 	seriesID := parts[3]
 
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesPtr, ok := s.series[seriesID]
+	series := snapshotSeriesValue(seriesPtr)
 	s.mu.RUnlock()
 
 	if !ok {
@@ -2306,13 +2395,14 @@ func (s *Server) handleCheckNow(w http.ResponseWriter, r *http.Request) {
 	// Trigger refresh in background, and auto-download if new chapters found.
 	// Pass the series by value snapshot: the background goroutine must not
 	// read the shared pointer while handleUpdateSeries mutates it.
+	seriesSnap := series
 	s.safeGoTrack("handleCheckNow", func() {
 		defer func() {
 			s.mu.Lock()
 			delete(s.checking, seriesID)
 			s.mu.Unlock()
 		}()
-		seriesCopy := *series
+		seriesCopy := seriesSnap
 		newChapters := s.refreshSeriesChapters(&seriesCopy)
 		if newChapters > 0 {
 			s.autoDownloadMissingChapters(seriesID, true)
@@ -2340,7 +2430,8 @@ func (s *Server) handleRefreshMetadata(w http.ResponseWriter, r *http.Request) {
 	seriesID := parts[3]
 
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesPtr, ok := s.series[seriesID]
+	series := snapshotSeriesValue(seriesPtr)
 	s.mu.RUnlock()
 	if !ok {
 		http.Error(w, "Series not found", http.StatusNotFound)
@@ -2502,7 +2593,8 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	seriesID := parts[3]
 
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesLive, ok := s.series[seriesID]
+	series := snapshotSeriesValue(seriesLive)
 	s.mu.RUnlock()
 
 	if !ok {
@@ -2558,12 +2650,13 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 	seriesID := parts[3]
 
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesLive, ok := s.series[seriesID]
 	if !ok {
 		s.mu.RUnlock()
 		http.Error(w, "Series not found", http.StatusNotFound)
 		return
 	}
+	series := snapshotSeriesValue(seriesLive)
 	chapters := s.chapters[seriesID]
 	s.mu.RUnlock()
 
@@ -2730,6 +2823,10 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Delete existing incomplete files and re-download
+		if !isValidChapterKey(chapterKey) {
+			log.Printf("[SCAN-MISSING] Skipping invalid chapter key: %q", chapterKey)
+			continue
+		}
 		if entries, err := os.ReadDir(filepath.Join(s.config.DownloadPath, folderName, "Chapter "+chapterKey)); err == nil {
 			for _, e := range entries {
 				if !e.IsDir() {
@@ -2858,12 +2955,13 @@ func (s *Server) handleForceRedownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesLive, ok := s.series[seriesID]
 	if !ok {
 		s.mu.RUnlock()
 		http.Error(w, "Series not found", http.StatusNotFound)
 		return
 	}
+	series := snapshotSeriesValue(seriesLive)
 	s.mu.RUnlock()
 
 	if series.URL == "" {
@@ -2884,10 +2982,11 @@ func (s *Server) handleForceRedownload(w http.ResponseWriter, r *http.Request) {
 
 	// Refresh chapter list synchronously, then hand the actual deletions and
 	// re-downloads off to a background goroutine tracked for safe shutdown.
-	s.refreshSeriesChapters(series)
+	s.refreshSeriesChapters(&series)
 
 	s.mu.RLock()
-	series, ok = s.series[seriesID]
+	seriesLive, ok = s.series[seriesID]
+	series = snapshotSeriesValue(seriesLive)
 	s.mu.RUnlock()
 	if !ok {
 		http.Error(w, "Series not found after refresh", http.StatusNotFound)
@@ -2903,6 +3002,14 @@ func (s *Server) handleForceRedownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find chapters in the specified range, mark for redownload.
+	// Resolve the in-memory chapter list once: a chapter that cannot be
+	// matched in s.chapters cannot be re-downloaded, so its files must NOT
+	// be deleted (delete-before-validate caused permanent data loss when
+	// the site removed a chapter or the refresh failed).
+	s.mu.RLock()
+	chaptersInMemory := s.chapters[seriesID]
+	s.mu.RUnlock()
+
 	toRedownload := make([]string, 0)
 	for chapterKey, chInfo := range chapterState.Chapters {
 		// Validate chapter key to prevent path traversal attacks
@@ -2913,12 +3020,24 @@ func (s *Server) handleForceRedownload(w http.ResponseWriter, r *http.Request) {
 		}
 		num := chInfo.Number
 		if num >= req.FromChapter && num <= req.ToChapter {
+			var inMemory bool
+			for _, ch := range chaptersInMemory {
+				if strconv.FormatFloat(ch.Number, 'f', -1, 64) == chapterKey {
+					inMemory = true
+					break
+				}
+			}
+			if !inMemory {
+				log.Printf("[FORCE-REDOWNLOAD] Chapter %s not found in memory, keeping files on disk", chapterKey)
+				continue
+			}
 			toRedownload = append(toRedownload, chapterKey)
 			// Delete eagerly under the lock (original semantics): a pre-fetch
 			// here would hold chapterStateMu across N network fetches and read
 			// s.chapters without s.mu. If the later redownload fetch fails,
 			// the chapter is already marked not-downloaded and auto-sync
 			// retries it.
+
 			chapterDir := filepath.Join(s.config.DownloadPath, folderName, "Chapter "+chapterKey)
 			os.RemoveAll(chapterDir)
 			chInfo.Downloaded = false
@@ -2958,11 +3077,12 @@ func (s *Server) handleForceRedownload(w http.ResponseWriter, r *http.Request) {
 // a range. It runs inside a safeGoTrack goroutine.
 func (s *Server) forceRedownloadChapters(seriesID, folderName string, scr scraper.Scraper, toRedownload []string, fromChapter, toChapter float64) {
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesLive, ok := s.series[seriesID]
 	if !ok {
 		s.mu.RUnlock()
 		return
 	}
+	series := snapshotSeriesValue(seriesLive)
 	chapters := s.chapters[seriesID]
 	s.mu.RUnlock()
 
@@ -3119,12 +3239,13 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 	}
 
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesLive, ok := s.series[seriesID]
 	if !ok {
 		s.mu.RUnlock()
 		http.Error(w, "Series not found", http.StatusNotFound)
 		return
 	}
+	series := snapshotSeriesValue(seriesLive)
 	chapters := s.chapters[seriesID]
 	s.mu.RUnlock()
 
@@ -3208,6 +3329,13 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 	if !exists {
 		s.chapterStateMu.Unlock()
 		http.Error(w, fmt.Sprintf("Chapter %s not found in state", chapterKey), http.StatusNotFound)
+		return
+	}
+
+	// Validate chapter key before joining path to prevent directory traversal
+	if !isValidChapterKey(chapterKey) {
+		log.Printf("[REDOWNLOAD-CHAPTER] Skipping invalid chapter key: %q", chapterKey)
+		http.Error(w, fmt.Sprintf("Invalid chapter key: %q", chapterKey), http.StatusBadRequest)
 		return
 	}
 	os.RemoveAll(filepath.Join(s.config.DownloadPath, folderName, "Chapter "+chapterKey))
@@ -3369,6 +3497,9 @@ func (s *Server) handleRecheckAllSeries(w http.ResponseWriter, r *http.Request) 
 				}
 				chNumStr := strings.TrimPrefix(strings.ToLower(ch.Name()), "chapter")
 				chNumStr = strings.TrimSpace(chNumStr)
+				if !isValidChapterKey(chNumStr) {
+					continue
+				}
 				chPath := filepath.Join(seriesPath, ch.Name())
 				files, _ := os.ReadDir(chPath)
 				imageCount := 0
@@ -3396,6 +3527,9 @@ func (s *Server) handleRecheckAllSeries(w http.ResponseWriter, r *http.Request) 
 				}
 				chNumStr := strings.TrimPrefix(strings.ToLower(ch.Name()), "chapter")
 				chNumStr = strings.TrimSpace(chNumStr)
+				if !isValidChapterKey(chNumStr) {
+					continue
+				}
 				chPath := filepath.Join(seriesPath, ch.Name())
 				files, _ := os.ReadDir(chPath)
 				imageCount := 0
@@ -3576,9 +3710,10 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	// Snapshot under the read lock: the manager mutates the live Download
-	// concurrently, so encoding the raw pointer races.
+	// concurrently, so encoding the raw pointer races. snapshotDownload takes
+	// dl.Mu to guard the struct copy against mid-write torn reads.
 	s.mu.RLock()
-	dlCopy := *dl
+	dlCopy := snapshotDownload(dl)
 	s.mu.RUnlock()
 	json.NewEncoder(w).Encode(dlCopy)
 }
@@ -3587,10 +3722,11 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListDownloads(w http.ResponseWriter, r *http.Request) {
 	// Copy by value under the read lock: the download manager mutates the
 	// live structs concurrently, so encoding raw pointers afterwards races.
+	// snapshotDownload takes dl.Mu per copy to guard against torn reads.
 	s.mu.RLock()
 	downloads := make([]models.Download, 0, len(s.downloads))
 	for _, dl := range s.downloads {
-		downloads = append(downloads, *dl)
+		downloads = append(downloads, snapshotDownload(dl))
 	}
 	s.mu.RUnlock()
 
@@ -3645,7 +3781,7 @@ func downloadSortRank(status models.DownloadStatus) int {
 func (s *Server) handleClearDownloads(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	for id, dl := range s.downloads {
-		if dl.Status == models.StatusCompleted || dl.Status == models.StatusFailed || dl.Status == models.StatusPartial {
+		if dl.Status == models.StatusCompleted || dl.Status == models.StatusFailed || dl.Status == models.StatusPartial || dl.Status == models.StatusCancelled {
 			delete(s.downloads, id)
 			delete(s.hmangaLastLoggedBytes, id)
 		}
@@ -3774,15 +3910,18 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	s.dlManager.SetMinImageSizeKB(s.config.MinImageSizeKB)
 	s.dlManager.SetMinImageWidth(s.config.MinImageWidth)
 	s.dlManager.SetMinImageHeight(s.config.MinImageHeight)
+	// Snapshot for the save + response while still under s.mu: concurrent
+	// scrapers/readers of s.config must never see a torn marshal.
+	saveCfg := *s.config
 	s.mu.Unlock()
 
-	// Persist config
-	if err := config.Save(s.config); err != nil {
+	// Persist config (outside s.mu: disk I/O must not hold the server lock)
+	if err := config.Save(&saveCfg); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save config: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	respCfg := *s.config
+	respCfg := saveCfg
 	respCfg.HentaiNexusPassword = ""
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3854,6 +3993,9 @@ func (s *Server) loadRegistry() (*SeriesRegistry, error) {
 		}
 		if e.CustomName != "" {
 			e.CustomName = fileutil.SanitizeFolderName(e.CustomName)
+		}
+		if e.Title != "" {
+			e.Title = fileutil.SanitizeFolderName(e.Title)
 		}
 	}
 
@@ -4215,7 +4357,8 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 	}()
 
 	s.mu.RLock()
-	series, ok := s.series[seriesID]
+	seriesLive, ok := s.series[seriesID]
+	series := snapshotSeriesValue(seriesLive)
 	s.mu.RUnlock()
 
 	if !ok {
@@ -4271,14 +4414,15 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 	// scheduler or check-now handler calls refreshSeriesChapters before
 	// invoking autoDownloadMissingChapters).
 	if !skipRefresh {
-		s.refreshSeriesChapters(series)
+		s.refreshSeriesChapters(&series)
 	}
 
 	// (Re-)read the series pointer and chapter state. If we refreshed, this
 	// picks up any new chapters. If we skipped refresh, the caller's refresh
 	// already updated in-memory state, and we just need the latest pointers.
 	s.mu.RLock()
-	series, ok = s.series[seriesID]
+	seriesLive, ok = s.series[seriesID]
+	series = snapshotSeriesValue(seriesLive)
 	s.mu.RUnlock()
 	if !ok {
 		log.Printf("Series %s not found after refresh", seriesName)
@@ -4543,7 +4687,11 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 			task.Mu.Unlock()
 			// Copy the updated info back to the chapterState map
 			chapterState.Chapters[chapterKey] = chInfo
-			downloadedCount++
+			// Count only fully-completed chapters as "downloaded" — partials
+			// would inflate the log and drift the count above ChapterCount.
+			if isDownloadComplete(dl) {
+				downloadedCount++
+			}
 
 			s.chapterStateMu.Lock()
 			// Re-load under lock to merge any concurrent writes from updateChapterState
@@ -5731,14 +5879,14 @@ async function loadSeries() {
             const lastCheckedDisplay = getLastCheckedDisplay(s.lastCheckedAt);
             const displayName = s.customName || s.title || '';
             const displayUrl = s.url || '';
-            return '<div class="series-item" data-id="' + escapeJsString(s.id) + '" onclick="toggleSeriesDetails(\'' + escapeJsString(s.id) + '\')">' +
+            return '<div class="series-item" data-id="' + escapeAttr(s.id) + '" onclick="toggleSeriesDetails(\'' + escapeJsString(s.id) + '\')">' +
                 '<span class="title" title="' + escapeAttr(displayName) + '">' + escapeHtml(displayName) + '</span>' +
                 '<span class="meta">' + escapeHtml(String(s.chapterCount)) + '</span>' +
                 '<span class="meta">' + escapeHtml(String(s.chaptersDownloaded)) + '</span>' +
                 '<span class="meta">' + escapeHtml(status) + '</span>' +
                 '<div class="actions" onclick="event.stopPropagation()">' +
                     '<div class="action-group">' +
-                        '<select class="interval-select" id="interval-' + escapeJsString(s.id) + '" name="interval-' + escapeJsString(s.id) + '" onchange="updateCheckInterval(\'' + escapeJsString(s.id) + '\', this.value)" title="Auto-check frequency">' +
+                        '<select class="interval-select" id="interval-' + escapeAttr(s.id) + '" name="interval-' + escapeAttr(s.id) + '" onchange="updateCheckInterval(\'' + escapeJsString(s.id) + '\', this.value)" title="Auto-check frequency">' +
                             '<option value="never"' + (s.checkInterval === 'never' || !s.checkInterval ? ' selected' : '') + '>Never</option>' +
                             '<option value="5m"' + (s.checkInterval === '5m' ? ' selected' : '') + '>5m</option>' +
                             '<option value="15m"' + (s.checkInterval === '15m' ? ' selected' : '') + '>15m</option>' +
@@ -5759,7 +5907,7 @@ async function loadSeries() {
                         '<button class="btn btn-secondary" onclick="refreshMetadata(\'' + escapeJsString(s.id) + '\')" title="Refresh series metadata and cover">Refresh Metadata</button>' +
                         '<button class="btn btn-danger" onclick="removeSeries(\'' + escapeJsString(s.id) + '\', \'' + escapeJsString(displayName) + '\')" title="Remove Series">Remove</button>' +
                 '</div>' +
-                '<div class="series-item-details" id="chapters-' + escapeJsString(s.id) + '" ></div>' +
+                '<div class="series-item-details" id="chapters-' + escapeAttr(s.id) + '" ></div>' +
             '</div>';
         }).join('');
 
@@ -6856,7 +7004,7 @@ function renderHMArtists(artists) {
                 '<span class="meta" data-field="status">' + status + '</span>' +
                 '<div class="actions" onclick="event.stopPropagation()">' +
                     '<div class="action-group">' +
-                        '<select class="interval-select" id="hm-interval-' + escapeJsString(a.id) + '" name="hm-interval-' + escapeJsString(a.id) + '" onchange="updateHMCheckInterval(\'' + escapeJsString(a.id) + '\', this.value)" title="Auto-check frequency">' +
+                        '<select class="interval-select" id="hm-interval-' + escapeAttr(a.id) + '" name="hm-interval-' + escapeAttr(a.id) + '" onchange="updateHMCheckInterval(\'' + escapeJsString(a.id) + '\', this.value)" title="Auto-check frequency">' +
                             '<option value="never"' + (a.checkInterval === 'never' || !a.checkInterval ? ' selected' : '') + '>Never</option>' +
                             '<option value="5m"' + (a.checkInterval === '5m' ? ' selected' : '') + '>5m</option>' +
                             '<option value="15m"' + (a.checkInterval === '15m' ? ' selected' : '') + '>15m</option>' +

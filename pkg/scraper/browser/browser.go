@@ -193,6 +193,9 @@ type Queue struct {
 	// original request's result channel. Guarded by keyedMu.
 	keyedMu      sync.Mutex
 	keyedWaiting map[string][]chan error
+	// keyedWaitingVal tracks value-returning keyed requests (RunWithPageKeyedVal)
+	// so piggybacked callers receive the first caller's result, not zero values.
+	keyedWaitingVal map[string][]chan keyedResult
 
 	// inflight tracks in-flight requests so Stop() can wait for them
 	// to complete before closing the context.
@@ -209,10 +212,11 @@ type Queue struct {
 // first call to Run and automatically closed after idleTimeout of inactivity.
 func NewQueue(cfg Config) *Queue {
 	q := &Queue{
-		cfg:          cfg,
-		reqch:        make(chan request),
-		done:         make(chan struct{}),
-		keyedWaiting: make(map[string][]chan error),
+		cfg:             cfg,
+		reqch:           make(chan request),
+		done:            make(chan struct{}),
+		keyedWaiting:    make(map[string][]chan error),
+		keyedWaitingVal: make(map[string][]chan keyedResult),
 	}
 	go q.processLoop()
 	return q
@@ -639,6 +643,65 @@ func (q *Queue) RunWithPageKeyed(key string, fn func(page playwright.Page) error
 		return err
 	}
 	return q.RunKeyed(key, wrapped)
+}
+
+// keyedResult is the type-erased result envelope shared with piggybacked
+// waiters by RunWithPageKeyedVal. Generic methods are not allowed in Go, so
+// the generic entry point is a package-level function and the per-key waiter
+// channels are stored as channels of keyedResult.
+type keyedResult struct {
+	val any
+	err error
+}
+
+// RunWithPageKeyedVal is RunWithPageKeyed for operations that return a value.
+// Concurrent callers with the same key share ONE execution AND its result:
+// piggybacked callers receive the first caller's (T, error), not zero values.
+// Without this, value-returning fetches deduplicated by key silently returned
+// empty content with a nil error. Empty key disables dedupe.
+func RunWithPageKeyedVal[T any](q *Queue, key string, fn func(page playwright.Page) (T, error)) (T, error) {
+	var zero T
+	if key == "" {
+		var v T
+		err := q.RunWithPage(func(page playwright.Page) error {
+			var e error
+			v, e = fn(page)
+			return e
+		})
+		return v, err
+	}
+
+	q.keyedMu.Lock()
+	if waiting, ok := q.keyedWaitingVal[key]; ok {
+		waitCh := make(chan keyedResult, 1)
+		q.keyedWaitingVal[key] = append(waiting, waitCh)
+		q.keyedMu.Unlock()
+		log.Printf("[BROWSER-QUEUE] Duplicate request for key %q deduplicated; sharing in-flight result", key)
+		r := <-waitCh
+		if r.err != nil {
+			return zero, r.err
+		}
+		v, _ := r.val.(T)
+		return v, nil
+	}
+	q.keyedWaitingVal[key] = nil
+	q.keyedMu.Unlock()
+
+	var val T
+	err := q.RunWithPage(func(page playwright.Page) error {
+		var e error
+		val, e = fn(page)
+		return e
+	})
+
+	q.keyedMu.Lock()
+	waiters := q.keyedWaitingVal[key]
+	delete(q.keyedWaitingVal, key)
+	q.keyedMu.Unlock()
+	for _, ch := range waiters {
+		ch <- keyedResult{val: val, err: err}
+	}
+	return val, err
 }
 
 // Run enqueues a Playwright operation.  It blocks until the operation

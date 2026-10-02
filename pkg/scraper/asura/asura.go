@@ -296,6 +296,16 @@ func (s *Scraper) ExtractImages(html string, chapterURL string) ([]models.Image,
 			}
 			seen[imgURL] = true
 
+			// Handle data-srcset: split on comma and take the first candidate URL
+			// e.g., "image.jpg 2x, image2.jpg 3x" -> "image.jpg"
+			if attr == "data-srcset" {
+				candidate := strings.Split(imgURL, ",")
+				imgURL = strings.TrimSpace(candidate[0])
+				if !strings.HasPrefix(imgURL, "http") {
+					continue
+				}
+			}
+
 			images = append(images, models.Image{
 				URL:     imgURL,
 				Page:    len(images) + 1,

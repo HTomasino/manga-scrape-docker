@@ -18,7 +18,7 @@ import (
 
 var (
 	// Match both root-level slug-chapter-{n}/ and traditional /chapter-{n} patterns
-	chapterPattern = regexp.MustCompile(`/(?:[^/]*-)?chapter-\d+`)
+	chapterPattern = regexp.MustCompile(`(?:/|-)chapter-\d+`)
 	chapterIDRegex = regexp.MustCompile(`CHAPTER_ID\s*=\s*(\d+)`)
 )
 

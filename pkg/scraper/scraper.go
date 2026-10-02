@@ -21,7 +21,7 @@ import (
 // Pre-compiled regex patterns
 var (
 	multiSlash    = regexp.MustCompile(`/{2,}`)
-	chapterRegex  = regexp.MustCompile(`(?i)chapter[/-=\s]?(\d+(?:\.\d+)?)`)
+	chapterRegex  = regexp.MustCompile(`(?i)chapter[-/_= ]?(\d+(?:\.\d+)?)`)
 	imageExtRegex = regexp.MustCompile(`\.(jpg|jpeg|png|gif|webp)(?:\?|$)`)
 
 	TrailingNumRegex = regexp.MustCompile(`/(\d+)\.\w+(?:\?|$)`)
@@ -388,24 +388,35 @@ type HTTPFetcher interface {
 
 // NormalizeURL normalizes a raw URL
 func NormalizeURL(rawURL string) string {
-	url := strings.TrimSpace(rawURL)
+	u, err := url.Parse(strings.TrimSpace(rawURL))
 
-	// Handle protocol separately to avoid breaking it
-	if strings.HasPrefix(url, "http://") {
-		url = "http://" + multiSlash.ReplaceAllString(url[7:], "/")
-	} else if strings.HasPrefix(url, "https://") {
-		url = "https://" + multiSlash.ReplaceAllString(url[8:], "/")
-	} else {
-		url = multiSlash.ReplaceAllString(url, "/")
-		if strings.HasPrefix(url, "//") {
-			url = "https:" + url
-		} else if strings.HasPrefix(url, "/") {
-			return url
+	if err != nil || u.Scheme == "" {
+		// Fall back to original behavior for unparseable or scheme-less URLs
+		url := strings.TrimSpace(rawURL)
+		if strings.HasPrefix(url, "http://") {
+			return "http://" + multiSlash.ReplaceAllString(url[7:], "/")
+		} else if strings.HasPrefix(url, "https://") {
+			return "https://" + multiSlash.ReplaceAllString(url[8:], "/")
 		} else {
-			url = "https://" + url
+			url = multiSlash.ReplaceAllString(url, "/")
+			if strings.HasPrefix(url, "//") {
+				return "https:" + url
+			} else if strings.HasPrefix(url, "/") {
+				return url
+			} else {
+				return "https://" + url
+			}
 		}
 	}
-	return url
+
+	// Lowercase scheme and host for case-insensitive URL normalization
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+
+	// Apply slash-collapse only to the path (not query or fragment)
+	u.Path = multiSlash.ReplaceAllString(u.Path, "/")
+
+	return u.String()
 }
 
 // NormalizeURLWithBase joins a relative URL with a base URL using proper URL resolution
@@ -489,11 +500,6 @@ func ExtractText(html string, selector string) string {
 		return ""
 	}
 	return strings.TrimSpace(doc.Find(selector).First().Text())
-}
-
-// ExtractTextFromHTML extracts text from the first element matching selector.
-func ExtractTextFromHTML(html string, selector string) string {
-	return ExtractText(html, selector)
 }
 
 // ExtractMetaContent returns the content attribute of a meta tag with the

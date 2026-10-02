@@ -147,6 +147,24 @@ func markZipRegexKeyPresence(data []byte, cfg *Config) {
 
 // Load loads configuration with migration support
 func Load() (*Config, error) {
+	// Try to load from unified location first
+	configPath := GetConfigPath()
+	if data, err := os.ReadFile(configPath); err == nil {
+		// Unmarshal into a fresh Config{}; never migration-save over an
+		// unparseable unified file.  If the unified file is broken we fall
+		// through to defaults rather than overwriting the user's recoverable
+		// config.
+		cfg := &Config{}
+		if err := json.Unmarshal(data, cfg); err != nil {
+			log.Printf("[CONFIG] Failed to parse %s (%v); applying defaults", configPath, err)
+		} else {
+			markZipRegexKeyPresence(data, cfg)
+			cfg.applyDownloadPathDefaults()
+			return cfg, nil
+		}
+	}
+
+	// Apply default values
 	cfg := &Config{
 		RateDelay:         500,
 		MinImageSizeKB:    0,
@@ -155,20 +173,11 @@ func Load() (*Config, error) {
 		UserAgent:         DefaultUserAgent,
 		BrowserBackground: true,
 	}
+	cfg.hmangaZipNameRegexKeyMissing = true
+	cfg.applyDownloadPathDefaults()
 
-	// Try to load from unified location first
-	configPath := GetConfigPath()
-	if data, err := os.ReadFile(configPath); err == nil {
-		if err := json.Unmarshal(data, cfg); err != nil {
-			log.Printf("[CONFIG] Failed to parse %s (%v); falling back to defaults/legacy", configPath, err)
-		} else {
-			markZipRegexKeyPresence(data, cfg)
-			cfg.applyDownloadPathDefaults()
-			return cfg, nil
-		}
-	}
-
-	// Try legacy locations for migration
+	// Try legacy locations for migration (only if unified was parseable or
+	// doesn't exist — we do not overwrite a broken unified file).
 	if runtime.GOOS == "windows" {
 		appData := os.Getenv("APPDATA")
 		for _, legacyPath := range legacyConfigPaths {
@@ -184,10 +193,6 @@ func Load() (*Config, error) {
 			}
 		}
 	}
-
-	// No config file anywhere: apply the default zip-name pattern.
-	cfg.hmangaZipNameRegexKeyMissing = true
-	cfg.applyDownloadPathDefaults()
 
 	return cfg, nil
 }

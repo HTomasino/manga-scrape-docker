@@ -196,22 +196,6 @@ func (s *Server) runHMangaOpDispatcher() {
 	}
 }
 
-// waitHMangaOpQueue waits on the queue condition variable with a timeout,
-// returning early if woken by Signal/Broadcast. Caller must hold
-// hmangaOpQueueMu (and still holds it on return).
-func (s *Server) waitHMangaOpQueue(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		time.Sleep(timeout)
-		s.hmangaOpQueueCond.Broadcast()
-		close(done)
-	}()
-	s.hmangaOpQueueCond.Wait()
-	// The Wait always returns after Broadcast; the goroutine's close is a
-	// bookkeeping no-op at that point.
-	<-done
-}
-
 func (s *Server) runHMangaOpBody(op *hmangaOpItem) {
 	var err error
 	switch op.kind {
@@ -318,6 +302,18 @@ func (s *Server) touchHMangaOpActivity(opID string) {
 	s.hmangaOpQueueMu.Unlock()
 }
 
+// waitHMangaOpQueue waits on the queue condition variable with a timeout,
+// returning early if woken by Signal/Broadcast. Caller must hold
+// hmangaOpQueueMu (and still holds it on return). cond.Wait releases the
+// mutex while parked, so concurrent enqueues and progress ticks are never
+// blocked by the sweep interval.
+func (s *Server) waitHMangaOpQueue(timeout time.Duration) {
+	go func() {
+		time.Sleep(timeout)
+		s.hmangaOpQueueCond.Broadcast()
+	}()
+	s.hmangaOpQueueCond.Wait()
+}
 func (s *Server) markHMangaOpFinished(opID string, status hmangaOpStatus) {
 	s.hmangaOpQueueMu.Lock()
 	defer s.hmangaOpQueueMu.Unlock()

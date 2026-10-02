@@ -24,6 +24,7 @@ type Manager struct {
 	httpClient     *httpclient.Client
 	config         *config.Config
 	fileOps        *fileutil.Operations
+	downloadPath   string
 	workerPool     chan struct{}
 	active         map[string]*Task
 	progressCB     func(*models.Download)
@@ -62,9 +63,13 @@ func NewManager(cfg *config.Config, httpClient *httpclient.Client) *Manager {
 	workerPool := make(chan struct{}, 3)
 
 	return &Manager{
-		httpClient:     httpClient,
-		config:         cfg,
-		fileOps:        fileutil.NewOperations(httpClient),
+		httpClient: httpClient,
+		config:     cfg,
+		fileOps:    fileutil.NewOperations(httpClient),
+		// Initialize from config: without this, downloads before the first
+		// settings save build chapter paths relative to the process CWD
+		// (empty downloadPath), which fails instantly in the container.
+		downloadPath:   cfg.DownloadPath,
 		workerPool:     workerPool,
 		active:         make(map[string]*Task),
 		minImageSizeKB: cfg.MinImageSizeKB,
@@ -85,30 +90,54 @@ func (m *Manager) SetProgressCallback(cb func(*models.Download)) {
 // BUG FIX #2: Callback is already set before this is called
 // BUG FIX #3: Verifies download completion before marking status
 func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
-	// Snapshot the mutable config under the lock so concurrent Set* calls
-	// (settings save) cannot race the download loop's reads.
+	// Per-run cancellation: create the context BEFORE registering so a
+	// CancelTask arriving between registration and cancel.Store cannot miss.
 	m.mu.Lock()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	task.cancel.Store(&cancel)
 	m.active[task.ID] = task
-	downloadPath := m.config.DownloadPath
+	downloadPath := m.downloadPath
+	if downloadPath == "" {
+		// SetDownloadPath is only called on a settings save; fall back to the
+		// config so a manager constructed before any save still downloads to
+		// the configured directory instead of the process CWD.
+		downloadPath = m.config.DownloadPath
+	}
 	minImageSizeKB := m.minImageSizeKB
 	minImageWidth := m.minImageWidth
 	minImageHeight := m.minImageHeight
 	m.mu.Unlock()
-
-	// Per-run cancellation: a new run of the same task ID replaces this entry,
-	// so CancelTask cancels via the run's own context.
-	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	task.cancel.Store(&cancel)
 
 	// Acquire worker slot
 	m.workerPool <- struct{}{}
 	defer func() { <-m.workerPool }()
 
+	// A cancel that arrived while we waited on the worker slot must not
+	// create the chapter directory or emit StatusDownloading.
+	select {
+	case <-ctx.Done():
+		download.Mu.Lock()
+		download.Status = models.StatusCancelled
+		download.UpdatedAt = time.Now()
+		download.Mu.Unlock()
+		m.notifyProgress(download)
+		m.mu.Lock()
+		if m.active[task.ID] == task {
+			delete(m.active, task.ID)
+		}
+		m.mu.Unlock()
+		return context.Cause(ctx)
+	default:
+	}
+
 	// Update status to downloading - using a helper that ensures proper mutex usage
+	download.Mu.Lock()
 	download.UpdateProgress(0, len(task.Images))
 	download.Status = models.StatusDownloading
+	download.PerImageStatus = nil
 	download.UpdatedAt = time.Now()
+	download.Mu.Unlock()
 	m.notifyProgress(download)
 
 	// Validate image sequence — log warnings but do not block downloads
@@ -135,8 +164,11 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 	}
 	chapterDir := filepath.Join(downloadPath, task.CustomName, "Chapter "+chapterNum)
 	if err := m.fileOps.EnsureDir(chapterDir); err != nil {
+		log.Printf("[DOWNLOAD] Failed to create directory %s: %v", chapterDir, err)
+		download.Mu.Lock()
 		download.MarkFailed()
 		download.UpdatedAt = time.Now()
+		download.Mu.Unlock()
 		m.notifyProgress(download)
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
@@ -149,8 +181,10 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 		// Honor cancellation between images.
 		select {
 		case <-ctx.Done():
+			download.Mu.Lock()
 			download.Status = models.StatusCancelled
 			download.UpdatedAt = time.Now()
+			download.Mu.Unlock()
 			m.notifyProgress(download)
 			m.mu.Lock()
 			if m.active[task.ID] == task {
@@ -169,8 +203,10 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 		// truncated file left by a crash should be re-downloaded.
 		if info, err := os.Stat(destPath); err == nil && info.Size() > 0 {
 			downloadedCount++
+			download.Mu.Lock()
 			download.UpdateProgress(downloadedCount, totalImages)
 			download.UpdatedAt = time.Now()
+			download.Mu.Unlock()
 			m.notifyProgress(download)
 			imageResults[i] = models.ImageResult{
 				Page:   pageNum,
@@ -204,6 +240,16 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 			// when demoniclibs.com fails)
 			if img.FallbackURL != "" {
 				if fallbackErr := m.fileOps.SaveImage(img.FallbackURL, destPath, minImageSizeKB, minImageWidth, minImageHeight, checkPortrait); fallbackErr != nil {
+					if fileutil.IsImageFiltered(fallbackErr) {
+						fmt.Printf("Skipping image %d: filtered via fallback URL %v\n", pageNum, fallbackErr)
+						imageResults[i] = models.ImageResult{
+							Page:   pageNum,
+							URL:    img.URL,
+							Status: models.ImageStatusFiltered,
+							Reason: fallbackErr.Error(),
+						}
+						continue
+					}
 					// Both primary and fallback failed
 					fmt.Printf("Warning: Failed to download image %d (primary: %v, fallback: %v)\n", pageNum, err, fallbackErr)
 					imageResults[i] = models.ImageResult{
@@ -216,8 +262,10 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 				}
 				// Fallback succeeded
 				downloadedCount++
+				download.Mu.Lock()
 				download.UpdateProgress(downloadedCount, totalImages)
 				download.UpdatedAt = time.Now()
+				download.Mu.Unlock()
 				m.notifyProgress(download)
 				imageResults[i] = models.ImageResult{
 					Page:   pageNum,
@@ -240,8 +288,10 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 		}
 
 		downloadedCount++
+		download.Mu.Lock()
 		download.UpdateProgress(downloadedCount, len(task.Images))
 		download.UpdatedAt = time.Now()
+		download.Mu.Unlock()
 		m.notifyProgress(download)
 		imageResults[i] = models.ImageResult{
 			Page:   pageNum,
@@ -256,6 +306,7 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 	task.Mu.Unlock()
 
 	// Copy image results to the Download object so progress callbacks can access them
+	download.Mu.Lock()
 	download.PerImageStatus = imageResults
 
 	// Count filtered and skipped images separately so a chapter that only
@@ -303,6 +354,7 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 		download.Progress = float64(effectiveCount) / float64(nonFilteredCount) * 100
 	}
 	download.UpdatedAt = time.Now()
+	download.Mu.Unlock()
 	m.notifyProgress(download)
 
 	m.mu.Lock()
@@ -376,7 +428,7 @@ func (m *Manager) CancelTask(taskID string) bool {
 func (m *Manager) SetDownloadPath(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.config.DownloadPath = path
+	m.downloadPath = path
 }
 
 func (m *Manager) SetMinImageSizeKB(kb int) {

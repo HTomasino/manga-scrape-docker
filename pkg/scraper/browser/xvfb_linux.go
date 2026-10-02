@@ -83,6 +83,7 @@ func ensureXvfb() error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start Xvfb on %s: %w", display, err)
 	}
+	go cmd.Wait()
 
 	// Wait for the socket to appear.
 	ready := false
@@ -96,6 +97,7 @@ func ensureXvfb() error {
 	}
 	if !ready {
 		_ = cmd.Process.Kill()
+		cmd.Wait()
 		return fmt.Errorf("Xvfb started on %s but the socket never appeared", display)
 	}
 	log.Printf("[XVFB] Xvfb ready on %s (pid %d)", display, cmd.Process.Pid)

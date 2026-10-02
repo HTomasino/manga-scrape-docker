@@ -43,7 +43,7 @@ type BookInfo struct {
 	URL          string    `json:"url"`
 	Downloaded   bool      `json:"downloaded"`
 	Filename     string    `json:"filename,omitempty"`
-	DownloadedAt time.Time `json:"downloadedAt,omitempty"`
+	DownloadedAt time.Time `json:"downloadedAt"`
 	FileSize     int64     `json:"fileSize,omitempty"`
 	// Extracted indicates the ZIP was extracted into a directory with the
 	// same basename as the ZIP (<ArtistFolder>/<zipBasename>/) and the ZIP
@@ -70,7 +70,7 @@ type GlobalBookEntry struct {
 	Filename        string    `json:"filename"`
 	OwnerArtistID   string    `json:"ownerArtistID"`
 	OwnerFolderName string    `json:"ownerFolderName"`
-	DownloadedAt    time.Time `json:"downloadedAt"`
+	DownloadedAt    time.Time `json:"downloadedAt,omitempty"`
 	FileSize        int64     `json:"fileSize"`
 	// Extracted mirrors BookInfo.Extracted: the artifact is an extracted
 	// folder (<OwnerFolderName>/<dirName>/), not a ZIP file.

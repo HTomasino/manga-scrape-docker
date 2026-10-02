@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	tsReaderPattern       = regexp.MustCompile(`(?s)ts_reader\.run\(\s*(\{.+?\})\s*\);`)
+	tsReaderPattern       = regexp.MustCompile(`(?s)ts_reader\.run\(\s*(\{.+?\})\s*;?\)`)
 	ravenscansBannerRegex = regexp.MustCompile(`background-image:\s*url\('([^']+)'\)`)
 )
 
@@ -86,6 +86,8 @@ func (s *Scraper) ExtractChapters(htmlStr string, baseURL string) ([]models.Chap
 		dataNum, _ := li.Attr("data-num")
 		var number float64
 		if dataNum != "" {
+			// Normalize comma decimal notation (e.g., "1,5" -> "1.5") before parsing
+			dataNum = strings.ReplaceAll(dataNum, ",", ".")
 			if n, err := strconv.ParseFloat(dataNum, 64); err == nil {
 				number = n
 			}

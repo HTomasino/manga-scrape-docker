@@ -24,11 +24,12 @@ const (
 func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (string, []*http.Cookie, string, error) {
 	log.Printf("[MANHUAUS-PLAYWRIGHT] Queuing browser request for: %s", pageURL)
 
-	var content string
-	var cookies []*http.Cookie
-	var userAgentStr string
-
-	err := q.RunWithPageKeyed(pageURL, func(page playwright.Page) error {
+	type fetchResult struct {
+		content string
+		cookies []*http.Cookie
+		ua      string
+	}
+	res, err := browser.RunWithPageKeyedVal(q, pageURL, func(page playwright.Page) (fetchResult, error) {
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Executing browser request for: %s", pageURL)
 
 		page.SetDefaultTimeout(60000)
@@ -37,7 +38,7 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 		if _, err := page.Goto(pageURL, playwright.PageGotoOptions{
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		}); err != nil {
-			return err
+			return fetchResult{}, err
 		}
 
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Waiting for Cloudflare challenge to resolve...")
@@ -61,23 +62,20 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 		if isCloudflareChallenge(title) {
 			currentURL := page.URL()
 			log.Printf("[MANHUAUS-PLAYWRIGHT] Challenge unresolved at timeout: title=%q url=%s", title, currentURL)
-			return fmt.Errorf("Cloudflare challenge did not resolve within %v (title: %q)", cloudflareWaitTimeout, title)
+			return fetchResult{}, fmt.Errorf("Cloudflare challenge did not resolve within %v (title: %q)", cloudflareWaitTimeout, title)
 		}
 
 		time.Sleep(postResolutionWait)
 
 		pageContent, err := page.Content()
 		if err != nil {
-			return fmt.Errorf("failed to get page content: %w", err)
+			return fetchResult{}, fmt.Errorf("failed to get page content: %w", err)
 		}
-		content = pageContent
 
 		// Extract the User-Agent from the browser context
 		userAgent, _ := page.Evaluate("() => navigator.userAgent")
-		if userAgent != nil {
-			userAgentStr, _ = userAgent.(string)
-		}
-		log.Printf("[MANHUAUS-PLAYWRIGHT] Browser User-Agent: %s", userAgentStr)
+		ua, _ := userAgent.(string)
+		log.Printf("[MANHUAUS-PLAYWRIGHT] Browser User-Agent: %s", ua)
 
 		// Extract cookies from the browser context for reuse in HTTP requests
 		playwrightCookies, err := page.Context().Cookies()
@@ -85,19 +83,21 @@ func FetchWithPlaywright(pageURL string, cfg browser.Config, q *browser.Queue) (
 			log.Printf("[MANHUAUS-PLAYWRIGHT] Warning: failed to extract cookies: %v", err)
 		}
 
-		cookies = browser.ConvertPlaywrightCookies(playwrightCookies)
+		cookies := browser.ConvertPlaywrightCookies(playwrightCookies)
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Extracted %d cookies for image downloads", len(cookies))
 
-		log.Printf("[MANHUAUS-PLAYWRIGHT] Successfully retrieved page content (%d bytes)", len(content))
-		return nil
+		log.Printf("[MANHUAUS-PLAYWRIGHT] Successfully retrieved page content (%d bytes)", len(pageContent))
+		return fetchResult{content: pageContent, cookies: cookies, ua: ua}, nil
 	})
 
 	if err != nil {
 		return "", nil, "", err
 	}
-	return content, cookies, userAgentStr, nil
+	return res.content, res.cookies, res.ua, nil
 }
 
 func isCloudflareChallenge(title string) bool {
-	return title == "Just a moment..." || title == "Attention Required! | Cloudflare"
+	return title == "Just a moment..." ||
+		title == "Attention Required! | Cloudflare" ||
+		title == "Verify you are human"
 }
