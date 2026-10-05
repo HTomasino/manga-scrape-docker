@@ -21,9 +21,15 @@ var (
 	entryIndexRegex        = regexp.MustCompile(`entry-index='(\d+)'`)
 )
 
+// manhuausCDNDomains lists every host image URLs may legitimately come from,
+// verified against live chapter pages and downloaded-chapter history:
+//   - img.manhuaus.com — the primary image CDN (/image/, /image2024/.../image2026/)
+//   - manhuaus.com     — WordPress wp-content/uploads/WP-manga/data paths
+//
+// img1.manhuaus.com previously served as a fallback mirror but no longer
+// resolves in DNS; it must not be re-added (see generateManhuausFallback).
 var manhuausCDNDomains = []string{
 	"img.manhuaus.com",
-	"img1.manhuaus.com",
 	"manhuaus.com",
 }
 
@@ -78,6 +84,14 @@ func (s *Scraper) GetUserAgent() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.userAgent
+}
+
+// FetchImageBytes implements download.BrowserImageFetcher. The image CDN
+// (img.manhuaus.com) rejects the plain HTTP client with a Cloudflare
+// challenge 403 even with the browser's cookies and User-Agent, so image
+// bytes are fetched through the browser session instead.
+func (s *Scraper) FetchImageBytes(imgURL string) ([]byte, error) {
+	return FetchImageBytesWithPlaywright(imgURL, s.browserCfg, s.browserQueue)
 }
 
 func (s *Scraper) ExtractChapters(html string, baseURL string) ([]models.Chapter, error) {
@@ -191,12 +205,9 @@ func (s *Scraper) ExtractImages(html string, chapterURL string) ([]models.Image,
 			}
 			seen[imgURL] = true
 
-			fallbackURL := generateManhuausFallback(imgURL)
-
 			images = append(images, models.Image{
-				URL:         imgURL,
-				FallbackURL: fallbackURL,
-				Page:        len(images) + 1,
+				URL:  imgURL,
+				Page: len(images) + 1,
 			})
 		}
 	})
@@ -225,13 +236,6 @@ func isManhuausCDN(imgURL string) bool {
 		}
 	}
 	return false
-}
-
-func generateManhuausFallback(imgURL string) string {
-	if strings.Contains(imgURL, "img.manhuaus.com") {
-		return strings.Replace(imgURL, "img.manhuaus.com", "img1.manhuaus.com", 1)
-	}
-	return ""
 }
 
 func (s *Scraper) ExtractSeriesInfo(html string, baseURL string) (models.SeriesInfo, error) {

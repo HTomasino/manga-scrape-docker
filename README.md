@@ -400,6 +400,7 @@ MIT
 
 ## Releases
 
+- **1.7.5** — 2026-10-05: fix ManhuaUS image downloads (Cloudflare now challenges the image CDN; image bytes fetched via browser session, dead img1 fallback removed, download-phase failures visible in console)
 - **1.7.4** — 2026-10-02: fix downloads failing instantly after container restart (downloadPath uninitialized)
 - **1.0.0** — 2026-09-30: Initial release of manga scraper with browser automation capabilities
 - **1.7.2** — 2026-09-30: browser/CDP and H-Manga enhancements

@@ -2853,6 +2853,7 @@ func (s *Server) handleScanMissing(w http.ResponseWriter, r *http.Request) {
 			ChapterNumber: chapter.Number,
 			URL:           chapter.URL,
 			Images:        images,
+			ImageFetcher:  scraperImageFetcher(scr),
 		}
 
 		s.dlManager.DownloadChapter(task, dl)
@@ -3150,6 +3151,7 @@ func (s *Server) forceRedownloadChapters(seriesID, folderName string, scr scrape
 			ChapterNumber: chapter.Number,
 			URL:           chapter.URL,
 			Images:        images,
+			ImageFetcher:  scraperImageFetcher(scr),
 		}
 
 		s.dlManager.DownloadChapter(task, dl)
@@ -3368,6 +3370,7 @@ func (s *Server) handleRedownloadChapter(w http.ResponseWriter, r *http.Request)
 		ChapterNumber: chapter.Number,
 		URL:           chapter.URL,
 		Images:        images,
+		ImageFetcher:  scraperImageFetcher(scr),
 	}
 
 	// Start download in background and track it for safe shutdown.
@@ -3700,6 +3703,7 @@ func (s *Server) handleStartDownload(w http.ResponseWriter, r *http.Request) {
 		ChapterNumber: chapter.Number,
 		URL:           chapter.URL,
 		Images:        images,
+		ImageFetcher:  scraperImageFetcher(scr),
 	}
 
 	// Start download in background and track it for safe shutdown.
@@ -4240,6 +4244,16 @@ func (s *Server) migrateOldStateFiles(registry *SeriesRegistry) error {
 	return nil
 }
 
+// scraperImageFetcher returns a download.BrowserImageFetcher when the scraper
+// fetches image bytes through the browser session (Cloudflare-challenged
+// image CDNs), nil otherwise. Assigned to download.Task.ImageFetcher.
+func scraperImageFetcher(scr scraper.Scraper) download.BrowserImageFetcher {
+	if bif, ok := scr.(download.BrowserImageFetcher); ok {
+		return bif
+	}
+	return nil
+}
+
 // extractImagesWithValidation extracts images from a chapter page and
 // performs sequence validation. If gaps are detected and the scraper
 // supports BrowserFetcher, it attempts one re-fetch with aggressive
@@ -4647,6 +4661,7 @@ func (s *Server) autoDownloadMissingChapters(seriesID string, args ...bool) {
 			ChapterNumber: chapter.Number,
 			URL:           chapter.URL,
 			Images:        images,
+			ImageFetcher:  scraperImageFetcher(scr),
 		}
 
 		s.dlManager.DownloadChapter(task, dl)

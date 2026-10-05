@@ -19,6 +19,15 @@ import (
 	"github.com/user/comic-scraper/pkg/scraper"
 )
 
+// BrowserImageFetcher fetches image bytes through a real browser session.
+// Implemented by scrapers whose image CDNs sit behind a Cloudflare challenge
+// that the plain HTTP client cannot pass (cookies + UA alone get 403 because
+// Cloudflare fingerprints the Go TLS client). When a Task carries one, the
+// download loop routes image fetches through it instead of the HTTP client.
+type BrowserImageFetcher interface {
+	FetchImageBytes(imgURL string) ([]byte, error)
+}
+
 // Manager handles comic chapter downloads with worker pool
 type Manager struct {
 	httpClient     *httpclient.Client
@@ -55,6 +64,11 @@ type Task struct {
 	// download loop checks it between images so cancellation actually stops
 	// the work instead of only removing the map entry.
 	cancel atomic.Pointer[context.CancelCauseFunc]
+
+	// ImageFetcher, when non-nil, fetches image bytes through the browser
+	// session (see BrowserImageFetcher). Set by the caller when the source
+	// site's image CDN rejects plain HTTP clients.
+	ImageFetcher BrowserImageFetcher
 }
 
 // NewManager creates a new download manager with the given configuration
@@ -223,11 +237,24 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 		// of aspect ratio.
 		checkPortrait := totalImages > 1 && (i == 0 || i == totalImages-1)
 
-		if err := m.fileOps.SaveImage(img.URL, destPath, minImageSizeKB, minImageWidth, minImageHeight, checkPortrait); err != nil {
+		// saveImage downloads via the task's browser image fetcher when one is
+		// set (Cloudflare-challenged CDNs), otherwise via the plain HTTP client.
+		saveImage := func(url string) error {
+			if task.ImageFetcher != nil {
+				data, ferr := task.ImageFetcher.FetchImageBytes(url)
+				if ferr != nil {
+					return fmt.Errorf("failed to download: %w", ferr)
+				}
+				return m.fileOps.SaveImageData(data, url, destPath, minImageSizeKB, minImageWidth, minImageHeight, checkPortrait)
+			}
+			return m.fileOps.SaveImage(url, destPath, minImageSizeKB, minImageWidth, minImageHeight, checkPortrait)
+		}
+
+		if err := saveImage(img.URL); err != nil {
 			// If the image was intentionally filtered (wrong dimensions or too small),
 			// skip it without retrying the fallback URL
 			if fileutil.IsImageFiltered(err) {
-				fmt.Printf("Skipping image %d: %v\n", pageNum, err)
+				log.Printf("[DOWNLOAD] Skipping image %d: %v", pageNum, err)
 				imageResults[i] = models.ImageResult{
 					Page:   pageNum,
 					URL:    img.URL,
@@ -239,9 +266,9 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 			// Try fallback URL if available (e.g., DemonicScans uses librarydm.com as fallback
 			// when demoniclibs.com fails)
 			if img.FallbackURL != "" {
-				if fallbackErr := m.fileOps.SaveImage(img.FallbackURL, destPath, minImageSizeKB, minImageWidth, minImageHeight, checkPortrait); fallbackErr != nil {
+				if fallbackErr := saveImage(img.FallbackURL); fallbackErr != nil {
 					if fileutil.IsImageFiltered(fallbackErr) {
-						fmt.Printf("Skipping image %d: filtered via fallback URL %v\n", pageNum, fallbackErr)
+						log.Printf("[DOWNLOAD] Skipping image %d: filtered via fallback URL %v", pageNum, fallbackErr)
 						imageResults[i] = models.ImageResult{
 							Page:   pageNum,
 							URL:    img.URL,
@@ -251,7 +278,7 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 						continue
 					}
 					// Both primary and fallback failed
-					fmt.Printf("Warning: Failed to download image %d (primary: %v, fallback: %v)\n", pageNum, err, fallbackErr)
+					log.Printf("[DOWNLOAD] Failed to download image %d (primary: %v, fallback: %v)", pageNum, err, fallbackErr)
 					imageResults[i] = models.ImageResult{
 						Page:   pageNum,
 						URL:    img.URL,
@@ -276,7 +303,7 @@ func (m *Manager) DownloadChapter(task *Task, download *models.Download) error {
 				continue
 			} else {
 				// No fallback available
-				fmt.Printf("Warning: Failed to download image %d: %v\n", pageNum, err)
+				log.Printf("[DOWNLOAD] Failed to download image %d: %v", pageNum, err)
 				imageResults[i] = models.ImageResult{
 					Page:   pageNum,
 					URL:    img.URL,

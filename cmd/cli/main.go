@@ -57,6 +57,17 @@ func cookieImportPath() string {
 	}
 	return ""
 }
+
+// scraperImageFetcher returns a download.BrowserImageFetcher when the scraper
+// fetches image bytes through the browser session (Cloudflare-challenged
+// image CDNs), nil otherwise. Assigned to download.Task.ImageFetcher.
+func scraperImageFetcher(scr scraper.Scraper) download.BrowserImageFetcher {
+	if bif, ok := scr.(download.BrowserImageFetcher); ok {
+		return bif
+	}
+	return nil
+}
+
 func main() {
 	// Load configuration
 	cfg, err := config.Load()
@@ -467,6 +478,7 @@ func (c *Commands) download(args []string) error {
 			ChapterNumber: chapter.Number,
 			URL:           chapter.URL,
 			Images:        images,
+			ImageFetcher:  scraperImageFetcher(scr),
 		}
 
 		dl := models.NewDownload(series.ID, chapter.ID, series.Title, chapter.Title)

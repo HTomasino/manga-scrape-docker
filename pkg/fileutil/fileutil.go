@@ -10,6 +10,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -92,6 +93,15 @@ func (o *Operations) SaveImage(url string, destPath string, minSizeKB int, minWi
 		return fmt.Errorf("failed to download: %w", err)
 	}
 
+	return o.SaveImageData(data, url, destPath, minSizeKB, minWidth, minHeight, checkPortrait)
+}
+
+// SaveImageData validates already-fetched image bytes against the same
+// dimension/size filters as SaveImage and writes them atomically to destPath.
+// Used by scrapers whose image CDNs sit behind a Cloudflare challenge the
+// plain HTTP client cannot pass (e.g. ManhuaUS): the bytes are fetched through
+// the browser session, then this shared filter decides keep vs skip.
+func (o *Operations) SaveImageData(data []byte, url string, destPath string, minSizeKB int, minWidth int, minHeight int, checkPortrait bool) error {
 	// Try dimension-based filtering first.
 	// When dimensions are available, we use portrait + min dimension checks.
 	// Size-based filtering applies as a secondary guard regardless of
@@ -137,7 +147,7 @@ func (o *Operations) SaveImage(url string, destPath string, minSizeKB int, minWi
 	// Log when dimension detection fails so the user knows this image bypassed
 	// the dimension filter. At this point it passed the size check (if any).
 	if dimErr != nil {
-		fmt.Printf("Warning: Could not verify image dimensions for %s: %v\n", url, dimErr)
+		log.Printf("[FILEUTIL] Could not verify image dimensions for %s: %v", url, dimErr)
 	}
 
 	// Write to a temp file and rename so a crash mid-write cannot leave a
