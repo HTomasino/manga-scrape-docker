@@ -1,3 +1,8 @@
+## fix: ManhuaUS browser image fetch blocked by CORS (1.7.6)
+
+- The in-page `fetch()` approach from 1.7.5 failed with `TypeError: Failed to fetch` on every image: `img.manhuaus.com` sends no `Access-Control-Allow-Origin` headers, so a cross-origin fetch from the `manhuaus.com` origin is blocked by CORS (top-level navigation is not). Live logs showed 16/16 images failing ~1s apart with the park-to-about:blank between ops.
+- `FetchImageBytesWithPlaywright` now navigates the persistent tab directly to the image URL and reads the body via Playwright's `Response.Body()` — no CORS restriction on top-level navigation, and the Cloudflare clearance from the site session still applies.
+
 ## fix: ManhuaUS image downloads 403 (Cloudflare on image CDN)
 
 - manhuaus.com's image CDN (`img.manhuaus.com`) now sits behind a Cloudflare challenge that rejects the plain HTTP client with 403 even with the browser's cookies and User-Agent (Cloudflare fingerprints the Go TLS client). Extraction still worked, so the console showed "images extracted" followed by silence and zero files saved.

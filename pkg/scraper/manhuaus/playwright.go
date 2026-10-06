@@ -1,7 +1,6 @@
 package manhuaus
 
 import (
-	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -106,55 +105,37 @@ func isCloudflareChallenge(title string) bool {
 // FetchImageBytesWithPlaywright fetches raw image bytes through the browser
 // session. The image CDN (img.manhuaus.com) sits behind a Cloudflare
 // challenge that rejects the plain HTTP client with 403 regardless of
-// cookies/UA — Cloudflare fingerprints the Go TLS client — so the bytes are
-// fetched from inside the persistent tab via the JS fetch API (same
-// origin/session as the challenge-passing browser) and returned as base64.
-// Routed through the shared queue like every other browser op.
+// cookies/UA — Cloudflare fingerprints the Go TLS client — so the bytes must
+// come from the challenge-passing browser. The tab navigates DIRECTLY to the
+// image URL and the response body is read via Playwright's Response.Body():
+// a JS in-page fetch() cannot be used because the CDN sends no
+// Access-Control-Allow-Origin headers, so a cross-origin fetch from the
+// manhuaus.com origin is blocked by CORS ("TypeError: Failed to fetch").
+// Top-level navigation has no CORS restriction. Routed through the shared
+// queue like every other browser op.
 func FetchImageBytesWithPlaywright(imgURL string, cfg browser.Config, q *browser.Queue) ([]byte, error) {
 	type imgResult struct {
-		data    []byte
-		content string
+		data []byte
 	}
 	res, err := browser.RunWithPageKeyedVal(q, imgURL, func(page playwright.Page) (imgResult, error) {
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Fetching image via browser: %s", imgURL)
 		page.SetDefaultTimeout(60000)
 
-		// Make sure the tab is on a manhuaus.com page so the fetch runs with
-		// the site's origin, cookies, and Cloudflare clearance. The persistent
-		// tab is parked on about:blank between ops.
-		if current := page.URL(); current == "about:blank" || current == "" {
-			if _, err := page.Goto("https://manhuaus.com/", playwright.PageGotoOptions{
-				WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-			}); err != nil {
-				return imgResult{}, fmt.Errorf("failed to navigate to site origin: %w", err)
-			}
-		}
-
-		const fetchJS = `
-async (url) => {
-	const resp = await fetch(url, { credentials: 'include' });
-	if (!resp.ok) { throw new Error('HTTP ' + resp.status + ': ' + url); }
-	const buf = await resp.arrayBuffer();
-	const bytes = new Uint8Array(buf);
-	let binary = '';
-	const chunk = 0x8000;
-	for (let i = 0; i < bytes.length; i += chunk) {
-		binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-	}
-	return btoa(binary);
-}
-`
-		raw, err := page.Evaluate(fetchJS, imgURL)
+		resp, err := page.Goto(imgURL, playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateCommit,
+		})
 		if err != nil {
-			return imgResult{}, fmt.Errorf("browser image fetch failed: %w", err)
+			return imgResult{}, fmt.Errorf("browser image navigation failed: %w", err)
 		}
-		b64, ok := raw.(string)
-		if !ok || b64 == "" {
-			return imgResult{}, fmt.Errorf("browser image fetch returned no data")
+		if resp == nil {
+			return imgResult{}, fmt.Errorf("browser image navigation returned no response")
 		}
-		data, err := base64.StdEncoding.DecodeString(b64)
+		if status := resp.Status(); status >= 400 {
+			return imgResult{}, fmt.Errorf("HTTP %d fetching image: %s", status, imgURL)
+		}
+		data, err := resp.Body()
 		if err != nil {
-			return imgResult{}, fmt.Errorf("failed to decode image data: %w", err)
+			return imgResult{}, fmt.Errorf("failed to read image body: %w", err)
 		}
 		log.Printf("[MANHUAUS-PLAYWRIGHT] Fetched %d image bytes via browser", len(data))
 		return imgResult{data: data}, nil
