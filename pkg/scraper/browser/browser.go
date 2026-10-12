@@ -351,6 +351,20 @@ func (q *Queue) ensureContext() (playwright.BrowserContext, error) {
 		b, cerr := browserType.ConnectOverCDP(q.cdpEndpoint)
 		q.pwMu.Unlock()
 		if cerr != nil {
+			// Recycle the driver: a failed connect can leave the node
+			// driver process dead (pipe EOF). Reusing q.pw would make
+			// every later attempt poll the dead pipe and fail identically
+			// forever; stopping it forces a fresh driver on the next try.
+			q.pwMu.Lock()
+			if q.pw != nil {
+				func() {
+					defer func() { recover() }() // Stop on a dead driver can panic
+					q.pw.Stop()
+				}()
+				q.pw = nil
+				log.Printf("[BROWSER-QUEUE] Playwright driver recycled after failed CDP connect")
+			}
+			q.pwMu.Unlock()
 			q.lastContextFail = time.Now()
 			return nil, fmt.Errorf("CDP connect to %s failed: %w", q.cdpEndpoint, cerr)
 		}
