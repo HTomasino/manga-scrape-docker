@@ -1,3 +1,8 @@
+## fix: CDP attach fails forever after the Playwright driver dies (1.7.7)
+
+- A failed `ConnectOverCDP` can leave the Playwright node driver process dead (pipe EOF: `target closed: could not read protocol padding: EOF`). The queue kept reusing the same dead `playwright` instance, so every later CDP attempt polled the dead pipe and failed identically forever (`pkg/scraper/browser/browser.go`).
+- On a failed CDP connect, the queue now stops the driver (panic-guarded, since `Stop` on a dead driver can panic) and nils it, forcing a fresh driver on the next attempt; logs `[BROWSER-QUEUE] Playwright driver recycled after failed CDP connect`.
+
 ## fix: ManhuaUS browser image fetch blocked by CORS (1.7.6)
 
 - The in-page `fetch()` approach from 1.7.5 failed with `TypeError: Failed to fetch` on every image: `img.manhuaus.com` sends no `Access-Control-Allow-Origin` headers, so a cross-origin fetch from the `manhuaus.com` origin is blocked by CORS (top-level navigation is not). Live logs showed 16/16 images failing ~1s apart with the park-to-about:blank between ops.
