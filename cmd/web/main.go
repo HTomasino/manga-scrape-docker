@@ -309,7 +309,7 @@ func NewServer() (*Server, error) {
 	registry.Register(manhuaus.NewScraperWithPlaywright(browserCfg, browserQueue))
 	registry.Register(manhuaplus.NewScraper(httpClient))
 	registry.Register(thunderscans.NewScraperWithPlaywright(browserCfg, browserQueue))
-	registry.Register(ravenscans.NewScraper())
+	registry.Register(ravenscans.NewScraperWithPlaywright(browserCfg, browserQueue))
 
 	// Create download manager
 	dlManager := download.NewManager(cfg, httpClient)

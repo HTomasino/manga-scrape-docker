@@ -400,6 +400,7 @@ MIT
 
 ## Releases
 
+- **1.7.8** — 2026-10-27: fix RavenScans Cloudflare 403 — fetch pages and image bytes via the browser session (Cloudflare managed challenge fronts ravenscans.org and its image CDN; fallback sources restricted to the ravenscans CDN allowlist)
 - **1.7.7** — 2026-10-12: fix CDP attach failing forever after the Playwright driver dies — recycle the driver (stop + nil) on a failed ConnectOverCDP so the next attempt gets a fresh driver instead of polling the dead pipe
 - **1.7.6** — 2026-10-06: fix ManhuaUS browser image fetch blocked by CORS — navigate the tab directly to the image URL and read the response body (in-page fetch() is CORS-blocked by the CDN)
 - **1.7.5** — 2026-10-05: fix ManhuaUS image downloads (Cloudflare now challenges the image CDN; image bytes fetched via browser session, dead img1 fallback removed, download-phase failures visible in console)

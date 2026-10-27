@@ -4,14 +4,17 @@ import (
 	"encoding/json"
 	"html"
 	"log"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/user/comic-scraper/pkg/models"
 	"github.com/user/comic-scraper/pkg/scraper"
+	"github.com/user/comic-scraper/pkg/scraper/browser"
 )
 
 var (
@@ -28,10 +31,63 @@ type tsReaderSource struct {
 	Images []string `json:"images"`
 }
 
-type Scraper struct{}
+// Scraper implements BrowserFetcher, CookieProvider, and BrowserImageFetcher
+// for RavenScans. Cloudflare fronts ravenscans.org (and cdn*.ravenscans.org)
+// with a managed challenge that the plain HTTP client cannot pass (HTTP 403 +
+// Cf-Mitigated: challenge), so page and image fetches go through Playwright.
+type BrowserConfig = browser.Config
+
+type Scraper struct {
+	cookies      []*http.Cookie
+	userAgent    string
+	mu           sync.Mutex
+	browserCfg   BrowserConfig
+	browserQueue *browser.Queue
+}
 
 func NewScraper() *Scraper {
 	return &Scraper{}
+}
+
+func NewScraperWithPlaywright(cfg BrowserConfig, q *browser.Queue) *Scraper {
+	return &Scraper{browserCfg: cfg, browserQueue: q}
+}
+
+func (s *Scraper) FetchHTML(url string) (string, error) {
+	log.Printf("[RAVENSCANS-FETCH] Using Playwright to bypass Cloudflare for: %s", url)
+	html, cookies, userAgent, err := FetchWithPlaywright(url, s.browserCfg, s.browserQueue)
+	if err != nil {
+		return "", err
+	}
+
+	s.mu.Lock()
+	s.cookies = cookies
+	s.userAgent = userAgent
+	s.mu.Unlock()
+
+	return html, nil
+}
+
+func (s *Scraper) GetCookies() []*http.Cookie {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cookies
+}
+
+// GetUserAgent returns the User-Agent used in the Playwright session.
+// Cloudflare ties cf_clearance to the UA that solved the challenge.
+func (s *Scraper) GetUserAgent() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.userAgent
+}
+
+// FetchImageBytes implements download.BrowserImageFetcher. The image CDN
+// rejects the plain HTTP client with a Cloudflare challenge 403 even with the
+// browser's cookies and User-Agent, so image bytes are fetched through the
+// browser session instead.
+func (s *Scraper) FetchImageBytes(imgURL string) ([]byte, error) {
+	return FetchImageBytesWithPlaywright(imgURL, s.browserCfg, s.browserQueue)
 }
 
 func (s *Scraper) Name() string {
@@ -254,7 +310,7 @@ func extractImagesFromReader(htmlStr string) []models.Image {
 			for i := 1; i < len(config.Sources); i++ {
 				if iterIdx < len(config.Sources[i].Images) {
 					fb := scraper.NormalizeURL(strings.TrimSpace(config.Sources[i].Images[iterIdx]))
-					if fb != "" && strings.HasPrefix(fb, "http") {
+					if fb != "" && strings.HasPrefix(fb, "http") && isRavenscansCDN(fb) {
 						fallbackURL = fb
 						break
 					}

@@ -1,3 +1,10 @@
+## fix: RavenScans Cloudflare 403 - fetch pages and images via browser session (1.7.8)
+
+- ravenscans.org (and `cdn*.ravenscans.org`) are now fronted by a Cloudflare managed challenge: the plain HTTP client gets 403 with `Cf-Mitigated: challenge` on chapter pages and on every image, so adds and downloads silently produced zero files.
+- New `pkg/scraper/ravenscans/playwright.go`: `FetchWithPlaywright` fetches pages through the shared browser queue (challenge-solving session), returning HTML + cookies + User-Agent; `FetchImageBytesWithPlaywright` navigates the persistent tab directly to the image URL and reads the body (same pattern as ManhuaUS 1.7.5/1.7.6).
+- `ravenscans.Scraper` now implements `BrowserFetcher`, `CookieProvider`, and `download.BrowserImageFetcher`; the session's cookies and UA are reused for HTTP fetches, and fallback image sources are restricted to the ravenscans CDN allowlist (`isRavenscansCDN`).
+- Registered via `NewScraperWithPlaywright` in both web and CLI entrypoints (`cmd/web/main.go`, `cmd/cli/main.go`).
+
 ## fix: CDP attach fails forever after the Playwright driver dies (1.7.7)
 
 - A failed `ConnectOverCDP` can leave the Playwright node driver process dead (pipe EOF: `target closed: could not read protocol padding: EOF`). The queue kept reusing the same dead `playwright` instance, so every later CDP attempt polled the dead pipe and failed identically forever (`pkg/scraper/browser/browser.go`).
